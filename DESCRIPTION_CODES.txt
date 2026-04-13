@@ -1,0 +1,201 @@
+DESCRIPTION DES 4 SCRIPTS (CODE PAR CODE)
+=========================================
+
+1) Objectif1_Prediction_Trafic_Urbain_V2.py
+-------------------------------------------
+Objectif
+- Prévoir le trafic/congestion urbain dans le temps (série temporelle), puis produire une prévision mensuelle sur 36 mois.
+- Générer des visualisations et une comparaison de modèles.
+
+Données / features
+- Lecture des fichiers: fact_circulation.csv, dim_trafic.csv, dim_zone.csv, dim_time.csv.
+- Création de variables temporelles depuis la colonne date: year, month, hour.
+- Cible (target) choisie automatiquement parmi les colonnes numériques disponibles:
+  - congestion_index si présente, sinon vitesse_moyenne, sinon la première colonne numérique trouvée.
+
+Valeurs manquantes
+- Suppression des lignes où la cible ou la date est manquante: dropna(subset=[target_col, 'date']).
+
+Valeurs aberrantes (outliers) — traitement et remplacement
+- Pour chaque colonne numérique (ex: congestion_index, vitesse_moyenne, etc.), clipping par quantiles 1%–99%:
+  - les valeurs < q1% sont remplacées par q1%
+  - les valeurs > q99% sont remplacées par q99%
+
+Normalisation / standardisation
+- Pas de StandardScaler/RobustScaler appliqué sur la série (approche série temporelle).
+- La transformation principale côté ML est la création de variables de lags + features saisonnières (month, sin/cos).
+
+Modèles utilisés
+- Baselines:
+  - SeasonalNaive (répète le même mois de l’année précédente si disponible, sinon dernier point)
+  - NaiveLast (dernier point observé)
+- Modèle statistique (si statsmodels disponible et conditions de longueur):
+  - SARIMAX (order=(1,1,1), seasonal_order=(1,1,1,12))
+- Modèle ML sur lags:
+  - GradientBoostingRegressor sur dataset supervisé (lags adaptatifs + month_sin/month_cos)
+  - Tuning via RandomizedSearchCV + TimeSeriesSplit si assez de points; sinon entraînement direct sans tuning.
+
+Évaluation et choix du meilleur modèle
+- Métriques utilisées sur une coupe temporelle (train/test sur les derniers mois):
+  - MAE, RMSE, MAPE
+- Les métriques sont rassemblées dans un tableau model_cmp et triées par RMSE.
+- Le “meilleur” modèle est celui qui a le plus petit RMSE (première ligne après tri).
+
+
+2) Objectif2_Recommandation_Trajets_V2.py
+----------------------------------------
+Objectif
+- Construire un score de qualité de trajet (quality_score) basé sur vitesse/temps/congestion.
+- Produire des recommandations (36 mois) et profiler des types de trajets via clustering.
+- Comparer 3 modèles de clustering et 3 modèles de régression (comparaison finale + plots).
+
+Données / features
+- Lecture de plusieurs dimensions (si présentes): fact_circulation, dim_zone, dim_ligne, dim_segment, dim_arret, dim_trafic, dim_time.
+- Enrichissement avec noms d’arrêts, villes, lignes, mode.
+
+Valeurs manquantes
+- Numériques: conversion en numérique puis remplacement des NaN par la moyenne de la colonne (fillna(mean)).
+- Textuelles (stop_from_nom/stop_to_nom/ville...): remplacement par 'N/A' ou valeurs par défaut.
+- Les lignes totalement vides sur les colonnes numériques sont supprimées: dropna(subset=numeric_cols, how='all').
+
+Valeurs aberrantes (outliers) — traitement et remplacement
+- Sur chaque variable numérique, clipping 1%–99%:
+  - les valeurs < q1% sont remplacées par q1%
+  - les valeurs > q99% sont remplacées par q99%
+
+Normalisation / standardisation
+- StandardScaler est utilisé à plusieurs endroits:
+  1) Pour standardiser vitesse/temps/congestion et construire les composantes normalisées:
+     - vitesse_norm = StandardScaler(vitesse)
+     - temps_norm = -StandardScaler(temps) (signe négatif car “moins = mieux”)
+     - congestion_norm = -StandardScaler(congestion)
+  2) Pour mettre à l’échelle les variables utilisées en clustering (X_seg_scaled = StandardScaler).
+  3) Pour mettre à l’échelle les variables utilisées en régression:
+     - X_scaled = StandardScaler(features)
+     - SVR et KNN utilisent explicitement les features standardisées.
+- Normalisation de quality_score entre -1 et 1 via min-max:
+  - quality_score = 2*(score - min)/(max-min) - 1
+
+Modèles utilisés
+A) Clustering
+- KMeans:
+  - sélection de k par recherche sur k_range (2 à ~10) et choix du k qui maximise le Silhouette.
+  - suivi aussi de l’inertie (Elbow) pour diagnostic.
+- DBSCAN:
+  - sweep sur eps ∈ {0.4, 0.6, 0.8, 1.0} et choix du meilleur silhouette si ≥2 clusters.
+- AgglomerativeClustering:
+  - n_clusters fixé sur le k retenu par KMeans (ou valeur fallback), puis comparaison.
+- Métriques de clustering:
+  - Silhouette (plus grand = mieux)
+  - Davies–Bouldin (plus petit = mieux)
+
+B) Régression / recommandation
+- Un modèle GradientBoostingRegressor est entraîné (RandomizedSearchCV, scoring='r2') pour prédire quality_score.
+- Comparaison finale “3 modèles” (avec tuning/CV):
+  - RandomForestRegressor (RandomizedSearchCV, cv=5)
+  - SVR (GridSearchCV, cv=5) sur features standardisées
+  - KNeighborsRegressor (GridSearchCV, cv=5) sur features standardisées
+
+Évaluation et choix du meilleur modèle
+- Clustering: comparaison par Silhouette (↑) et Davies–Bouldin (↓); les tableaux/plots comparent les modèles.
+- Régression: comparaison sur test set avec:
+  - R² (↑) et MAE (↓)
+- Dans la comparaison régression finale, les modèles sont triés par R² décroissant; le “meilleur” est celui avec le plus grand R² (et idéalement MAE faible).
+
+
+3) Objectif3_Classification_Risques_V2.py
+----------------------------------------
+Objectif
+- Classifier un niveau de risque binaire (risk_level: 0=Low, 1=High) par zone et période.
+- Comparer 3 classifieurs avec tuning + validation croisée.
+- Générer des prédictions futures sur 36 mois + visualisations.
+
+Données / features
+- Lecture: fact_safetyroad.csv (sinon erreur si vide), dim_zone.csv, et optionnellement dim_accidents.csv, dim_delinquence.csv.
+- Création de date, year, month.
+- Features:
+  - Numériques: volume, taux_1000, gravite_score, vulnerable_count + year/month/zone_id si présents.
+  - Catégorielles: type, gravite, categorie, zone_nom si présents.
+
+Création de la target (risk_level)
+- risk_level = 1 si l’observation dépasse le 75e percentile d’au moins un indicateur disponible parmi:
+  - volume, taux_1000, gravite_score, vulnerable_count
+- Fallback: si la target ne contient qu’une seule classe, création d’un proxy score basé sur les rangs percentiles moyens des features numériques disponibles pour re-créer 2 classes.
+
+Valeurs manquantes
+- Pas de drop agressif sur toutes les colonnes (pour éviter un dataset vide).
+- Gestion via pipeline:
+  - numériques: SimpleImputer(strategy='median')
+  - catégorielles: SimpleImputer(strategy='most_frequent')
+
+Valeurs aberrantes (outliers) — traitement et remplacement
+- QuantileClipper dans le pipeline numérique (par colonne), quantiles 1%–99%:
+  - valeurs < q1% remplacées par q1%
+  - valeurs > q99% remplacées par q99%
+
+Normalisation / standardisation
+- Numériques: RobustScaler (centrage médiane + échelle IQR), après clipping.
+- Catégorielles: OneHotEncoder(handle_unknown='ignore').
+
+Modèles utilisés (3 modèles)
+- LogisticRegression (class_weight='balanced') + GridSearchCV
+- RandomForestClassifier (class_weight='balanced') + GridSearchCV
+- SVC kernel RBF (class_weight='balanced', probability=True) + GridSearchCV
+- Validation croisée: StratifiedKFold(n_splits=5).
+
+Évaluation et choix du meilleur modèle
+- Métriques sur le test set:
+  - accuracy, precision, recall, f1, roc_auc
+- Le meilleur modèle est sélectionné par F1 maximal (best_f1).
+- La table results_df est aussi triée par f1 puis roc_auc (pour comparaison).
+
+
+4) Objectif4_Estimation_CO2_Energie.py
+--------------------------------------
+Objectif
+- Prédire des variables continues liées à l’environnement:
+  - co2_kg (obligatoire)
+  - energie_kwh (si la colonne existe)
+- Comparer 3 modèles de régression avec tuning + CV.
+- Générer des prédictions futures sur 36 mois + visualisations.
+
+Données / features
+- Lecture: fact_energieconsomation.csv, dim_emission_co2.csv, dim_energietransport.csv (+ dim_zone.csv si dispo pour les noms).
+- Features candidates:
+  - Numériques: activity_value, emission_factor, dechets_kg, station_kwh + year/month
+  - Catégorielles: zone_id, mode, type_energie, source_energie, activity_type
+
+Valeurs manquantes
+- Dans la phase de modélisation (pipeline):
+  - numériques: SimpleImputer(strategy='median')
+  - catégorielles: SimpleImputer(strategy='most_frequent')
+- Les cibles manquantes sont supprimées pour l’entraînement: dropna(subset=[target_col]).
+
+Valeurs aberrantes (outliers) — traitement et remplacement
+- QuantileClipper dans le pipeline numérique, quantiles 1%–99%:
+  - valeurs < q1% remplacées par q1%
+  - valeurs > q99% remplacées par q99%
+
+Normalisation / standardisation
+- Numériques: RobustScaler après clipping.
+- Catégorielles: OneHotEncoder(handle_unknown='ignore').
+
+Modèles utilisés (3 modèles)
+- Ridge:
+  - tuning via GridSearchCV (alpha)
+- RandomForestRegressor:
+  - tuning via RandomizedSearchCV (n_estimators, max_depth, min_samples_split/leaf, max_features, ...)
+- LinearSVR:
+  - tuning via RandomizedSearchCV (C, epsilon)
+- Validation croisée: KFold(n_splits=5, shuffle=True).
+
+Évaluation et choix du meilleur modèle
+- Métriques calculées sur test set:
+  - RMSE, MAE, R² (et MSE en interne)
+- Le meilleur modèle est celui qui minimise le RMSE.
+- Un plot de comparaison (RMSE/MAE/R2) est produit pour chaque cible.
+
+
+FIN
+---
+Ce fichier décrit ce que font réellement les scripts (prétraitement, modèles, critères de choix) tel qu’implémenté dans le code.
