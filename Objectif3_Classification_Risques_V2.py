@@ -1,78 +1,184 @@
-"""OBJECTIF 3: CLASSIFIER LES NIVEAUX DE RISQUE (ACCIDENTS, CRIMINALITÉ)
+"""OBJECTIF 3 — Classification des niveaux de risque (3 modèles).
 
-Ce script entraîne plusieurs modèles de classification, compare leurs performances
-et génère des prédictions de risque sur 36 mois, avec des visualisations.
+Ce module est utilisé par l'API (voir api2.py). Contraintes importantes:
+- Ne PAS entraîner le modèle à l'import.
+- Entraîner/charger à la demande (cache .pkl).
+- Comparer 3 modèles (LogReg / RandomForest / SVM RBF) et retenir le meilleur (F1).
+
+Correction principale vs versions "light":
+- Target plus logique (on évite d'utiliser le volume comme indicateur de risque par défaut).
+- Seuils de création de la target calculés uniquement sur le train (évite la fuite de données).
 """
 
-# ============ DÉPENDANCES / COMPAT COLAB vs PYTHON ============
 from __future__ import annotations
 
-import sys
-import warnings
-from dataclasses import dataclass
-from datetime import timedelta
-from pathlib import Path
+# IMPORTANT: limiter les threads BLAS *avant* l'import de numpy/scikit
+import os
 
-import matplotlib.pyplot as plt
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+
+import logging
+import pickle
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from difflib import get_close_matches
+from pathlib import Path
+from typing import Any
+
 import numpy as np
 import pandas as pd
-import seaborn as sns
 
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     accuracy_score,
-    auc,
     confusion_matrix,
     f1_score,
     precision_score,
     recall_score,
     roc_auc_score,
-    roc_curve,
 )
 from sklearn.model_selection import GridSearchCV, StratifiedKFold, train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, RobustScaler
-from sklearn.ensemble import RandomForestClassifier
 from sklearn.svm import SVC
 
-warnings.filterwarnings("ignore")
+LOGGER = logging.getLogger(__name__)
 
 
-def _is_colab() -> bool:
+# ============================
+# CONFIG DB (surcharge possible via env DB_*)
+# ============================
+DB_ENV_VARS = ["DB_HOST", "DB_PORT", "DB_NAME", "DB_USER", "DB_PASSWORD"]
+
+os.environ.setdefault("DB_HOST", "localhost")
+os.environ.setdefault("DB_PORT", "5432")
+os.environ.setdefault("DB_NAME", "urbain_dw")
+os.environ.setdefault("DB_USER", "postgres")
+os.environ.setdefault("DB_PASSWORD", "admin")
+os.environ.setdefault("DB_SCHEMA", "public")
+
+# FAST_MODE=1 => tuning plus léger + chargement DB limité (recommandé pour API)
+FAST_MODE = os.getenv("FAST_MODE", "1").strip().lower() not in ("0", "false", "no")
+
+_ENGINE = None
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _qident(name: str) -> str:
+    return '"' + str(name).replace('"', '""') + '"'
+
+
+def _db_enabled() -> bool:
+    return all(os.getenv(v) for v in DB_ENV_VARS)
+
+
+def _get_engine():
+    """Crée un engine SQLAlchemy pour PostgreSQL."""
     try:
-        import google.colab  # type: ignore
+        from sqlalchemy import create_engine  # type: ignore
+        from sqlalchemy.engine import URL  # type: ignore
+    except Exception as e:  # pragma: no cover
+        raise ImportError(
+            "SQLAlchemy n'est pas installé. Installe: pip install sqlalchemy psycopg2-binary"
+        ) from e
 
-        return True
-    except Exception:
-        return False
+    host = os.getenv("DB_HOST")
+    port = os.getenv("DB_PORT", "5432")
+    name = os.getenv("DB_NAME")
+    user = os.getenv("DB_USER")
+    password = os.getenv("DB_PASSWORD")
 
-
-def _data_dir() -> Path:
-    try:
-        return Path(__file__).resolve().parent
-    except Exception:
-        return Path.cwd()
-
-
-def _read_csv(filename: str) -> pd.DataFrame:
-    """Lit un CSV depuis Colab (upload) ou depuis le dossier du script."""
-    p = _data_dir() / filename
-    if p.exists():
-        return pd.read_csv(p)
-    # fallback: cwd
-    p2 = Path.cwd() / filename
-    if p2.exists():
-        return pd.read_csv(p2)
-    raise FileNotFoundError(
-        f"Fichier introuvable: {filename}. Place-le dans {_data_dir()} ou dans le répertoire courant."
+    url = URL.create(
+        drivername="postgresql+psycopg2",
+        username=user,
+        password=password,
+        host=host,
+        port=int(port) if str(port).isdigit() else port,
+        database=name,
     )
+    return create_engine(url, pool_pre_ping=True)
+
+
+def _read_sql(sql: str) -> pd.DataFrame:
+    global _ENGINE
+    if _ENGINE is None:
+        _ENGINE = _get_engine()
+    try:
+        conn = _ENGINE.raw_connection()
+        try:
+            return pd.read_sql_query(sql, conn)
+        finally:
+            conn.close()
+    except Exception:
+        return pd.read_sql_query(sql, _ENGINE)
+
+
+def _db_limit_rows() -> int | None:
+    """Lit DB_LIMIT_ROWS si défini, sinon applique un défaut en FAST_MODE."""
+    v = os.getenv("DB_LIMIT_ROWS", "").strip()
+    if v:
+        try:
+            n = int(v)
+            return n if n > 0 else None
+        except Exception:
+            return None
+    return 20000 if FAST_MODE else None
+
+
+def _list_tables(schema: str = "public") -> list[str]:
+    sql = (
+        "SELECT table_name FROM information_schema.tables "
+        f"WHERE table_schema='{schema}' AND table_type='BASE TABLE' ORDER BY table_name;"
+    )
+    d = _read_sql(sql)
+    if "table_name" not in d.columns:
+        return []
+    return [str(x) for x in d["table_name"].dropna().tolist()]
+
+
+def _resolve_table(
+    preferred: str,
+    schema: str = "public",
+    like_patterns: list[str] | None = None,
+) -> str | None:
+    tables = _list_tables(schema=schema)
+    if preferred in tables:
+        return preferred
+
+    if like_patterns:
+        for pat in like_patterns:
+            pat_sql = pat.replace("'", "''")
+            sql = (
+                "SELECT table_name FROM information_schema.tables "
+                f"WHERE table_schema='{schema}' AND table_name ILIKE '{pat_sql}' "
+                "ORDER BY table_name;"
+            )
+            m = _read_sql(sql)
+            if "table_name" in m.columns and len(m) > 0:
+                return str(m["table_name"].iloc[0])
+
+    close = get_close_matches(preferred, tables, n=1, cutoff=0.65)
+    return close[0] if close else None
+
+
+def _read_table(table: str, schema: str = "public", limit: int | None = None) -> pd.DataFrame:
+    lim = limit if limit is not None else _db_limit_rows()
+    if lim is not None:
+        return _read_sql(f"SELECT * FROM {_qident(schema)}.{_qident(table)} LIMIT {int(lim)};")
+    return _read_sql(f"SELECT * FROM {_qident(schema)}.{_qident(table)};")
 
 
 class QuantileClipper(BaseEstimator, TransformerMixin):
-    """Clippe les valeurs extrêmes (outliers) par quantiles, colonne par colonne."""
+    """Clippe les valeurs extrêmes par quantiles, colonne par colonne."""
 
     def __init__(self, lower_q: float = 0.01, upper_q: float = 0.99):
         self.lower_q = lower_q
@@ -92,727 +198,671 @@ class QuantileClipper(BaseEstimator, TransformerMixin):
             raise RuntimeError("QuantileClipper not fitted")
         return np.clip(X_arr, self.lower_bounds_, self.upper_bounds_)
 
-# ============ CHARGEMENT DES DONNÉES ============
-print("⚠️ OBJECTIF 3: CLASSIFIER LES NIVEAUX DE RISQUE\n")
-print("📊 CHARGEMENT DES DONNÉES...")
 
-if _is_colab():
-    try:
-        from google.colab import files  # type: ignore
-
-        _ = files.upload()
-    except Exception:
-        pass
-
-# Charger les données
+# Rend la sérialisation (pickle/joblib) plus robuste quand le script est exécuté en tant que __main__.
+# Sans ça, les pickles peuvent référencer '__main__.QuantileClipper' et être impossibles à recharger depuis l'API.
 try:
-    fact_safetyroad = _read_csv('fact_safetyroad.csv')
-    print(f"✓ fact_safetyroad chargé: {fact_safetyroad.shape}")
-except:
-    print("⚠️ fact_safetyroad non trouvé, utilisation de fact_circulation")
-    fact_safetyroad = None
+    QuantileClipper.__module__ = Path(__file__).stem
+except Exception:
+    pass
 
-try:
-    dim_accidents = _read_csv('dim_accidents.csv')
-    print(f"✓ dim_accidents chargé: {dim_accidents.shape}")
-except:
-    dim_accidents = None
-    print("⚠️ dim_accidents non trouvé")
 
-try:
-    dim_delinquence = _read_csv('dim_delinquence.csv')
-    print(f"✓ dim_delinquence chargé: {dim_delinquence.shape}")
-except:
-    dim_delinquence = None
-    print("⚠️ dim_delinquence non trouvé")
+# ============================
+# MODEL CACHE
+# ============================
+@dataclass(frozen=True)
+class ModelInfo:
+    best_model: str
+    best_f1: float
+    metrics: list[dict[str, Any]]
+    feature_cols: list[str]
+    num_cols: list[str]
+    cat_cols: list[str]
+    target_mode: str
+    target_definition: str
+    target_thresholds: dict[str, float]
+    target_metrics: list[str]
+    trained_at: str
 
-dim_zone = _read_csv('dim_zone.csv')
-print(f"✓ dim_zone chargé: {dim_zone.shape}")
 
-# ============ EXPLORATION DES DONNÉES ============
-print("\n📈 EXPLORATION DES DONNÉES...")
+def _cache_paths() -> tuple[Path, Path]:
+    base = Path(__file__).resolve().parent
+    # v2: évite d'essayer de charger d'anciens pickles incompatibles
+    model_path = base / "Objectif3_best_model_v2.pkl"
+    info_path = base / "Objectif3_model_info_v2.pkl"
+    return model_path, info_path
 
-if fact_safetyroad is not None:
-    print(f"Colonnes fact_safetyroad: {list(fact_safetyroad.columns)}")
-    
-if dim_accidents is not None:
-    print(f"Colonnes dim_accidents: {list(dim_accidents.columns)}")
-    
-if dim_delinquence is not None:
-    print(f"Colonnes dim_delinquence: {list(dim_delinquence.columns)}")
 
-print(f"Colonnes dim_zone: {list(dim_zone.columns)}")
-
-# ============ PRÉPARATION DES DONNÉES ============
-print("\n🔧 PRÉPARATION DES DONNÉES...")
-
-# Utiliser fact_safetyroad comme base
-df = fact_safetyroad.copy() if fact_safetyroad is not None else pd.DataFrame()
-
-print(f"fact_safetyroad shape: {df.shape}")
-print(f"Colonnes: {list(df.columns)}")
-
-if len(df) == 0:
-    raise ValueError("Aucune donnée disponible: fact_safetyroad est vide/introuvable")
-
-# Joindre dim_zone sur fk_zone (robuste aux noms de colonnes)
-zone_name_col = 'zone_nom' if 'zone_nom' in dim_zone.columns else (
-    'zone_name' if 'zone_name' in dim_zone.columns else None
-)
-zone_keep_cols = ['zone_id'] + ([zone_name_col] if zone_name_col else [])
-if 'fk_zone' in df.columns and 'zone_id' in dim_zone.columns:
-    df = df.merge(dim_zone[zone_keep_cols], left_on='fk_zone', right_on='zone_id', how='left')
-else:
-    # fallback: si pas de clé, au moins garder zone_id si présent
-    if 'zone_id' not in df.columns:
-        df['zone_id'] = 1
-    if zone_name_col and zone_name_col not in df.columns:
-        df[zone_name_col] = df['zone_id'].apply(lambda z: f"Zone_{z}")
-
-if zone_name_col is None:
-    df['zone_nom'] = df.get('zone_nom', df.get('zone_name', 'Zone'))
-else:
-    if zone_name_col != 'zone_nom':
-        df['zone_nom'] = df[zone_name_col]
-
-print(f"Après merge dim_zone: {df.shape}")
-
-if dim_accidents is not None and 'fk_accident' in df.columns:
-    accident_id_col = 'accident_id' if 'accident_id' in dim_accidents.columns else None
-    if accident_id_col:
-        keep = [accident_id_col]
-        for c in ['type', 'gravite', 'severity', 'accident_type']:
-            if c in dim_accidents.columns:
-                keep.append(c)
-        df = df.merge(dim_accidents[keep], left_on='fk_accident', right_on=accident_id_col, how='left')
-
-print(f"Après merge dim_accidents: {df.shape}")
-
-if dim_delinquence is not None and 'fk_crime' in df.columns:
-    crime_id_col = 'crime_id' if 'crime_id' in dim_delinquence.columns else None
-    if crime_id_col:
-        keep = [crime_id_col]
-        for c in ['periode_mois', 'categorie', 'category']:
-            if c in dim_delinquence.columns:
-                keep.append(c)
-        df = df.merge(dim_delinquence[keep], left_on='fk_crime', right_on=crime_id_col, how='left')
-
-print(f"Après merge dim_delinquence: {df.shape}")
-
-# ========== CRÉER LES COLONNES DATE/TIME ==========
-print("\n📅 Création des colonnes temporelles...")
-
-# Utiliser periode_mois si disponible
-if 'periode_mois' in df.columns and df['periode_mois'].notna().any():
+def _load_cached() -> tuple[Pipeline | None, ModelInfo | None]:
+    model_path, info_path = _cache_paths()
+    if not model_path.exists() or not info_path.exists():
+        return None, None
     try:
-        df['date'] = pd.to_datetime(df['periode_mois'], format='%Y%m', errors='coerce')
-    except:
-        df['date'] = pd.date_range('2023-01-01', periods=len(df), freq='D')
-else:
-    df['date'] = pd.date_range('2023-01-01', periods=len(df), freq='D')
-
-df['year'] = df['date'].dt.year
-df['month'] = df['date'].dt.month
-
-print(f"✓ Date range: {df['date'].min()} à {df['date'].max()}")
-
-# ========== CRÉER LES COLONNES FEATURES ==========
-print("\n📊 Création des features...")
-
-# Utiliser volume et taux_1000 comme features principales
-numeric_cols = []
-if 'volume' in df.columns:
-    numeric_cols.append('volume')
-if 'taux_1000' in df.columns:
-    numeric_cols.append('taux_1000')
-
-print(f"✓ Features disponibles: {numeric_cols}")
-
-# Créer des features supplémentaires si gravite existe
-if 'gravite' in df.columns:
-    gravite_map = {'faible': 1, 'moyen': 2, 'élevé': 3, 'grave': 4, 'très grave': 5}
-    df['gravite_score'] = df['gravite'].map(gravite_map).fillna(2)
-    numeric_cols.append('gravite_score')
-    print(f"✓ gravite_score ajouté")
-
-# Ajouter usager_vulnerable comme feature
-if 'usager_vulnerable' in df.columns:
-    df['vulnerable_count'] = df['usager_vulnerable'].fillna(0)
-    numeric_cols.append('vulnerable_count')
-    print(f"✓ vulnerable_count ajouté")
-
-print(f"\n✓ Features finales: {numeric_cols}")
-
-# Ajouter des features temporelles et d'identité (utiles pour capturer saisonnalité / spatial)
-for c in ['year', 'month', 'zone_id']:
-    if c in df.columns and c not in numeric_cols:
-        numeric_cols.append(c)
-
-# ========== PRÉPARER LES DONNÉES POUR ML ==========
-print("\n🎯 Préparation du dataset ML...")
-
-# Garder seulement les lignes avec les colonnes nécessaires (sans doublons)
-# IMPORTANT: on évite de drop tout le dataset; l'imputation est gérée dans les pipelines.
-base_cols = list(dict.fromkeys(numeric_cols + ['zone_id', 'zone_nom', 'year', 'month', 'date']))
-base_cols = [c for c in base_cols if c in df.columns]
-if not base_cols:
-    raise ValueError(f"Aucune colonne utilisable pour le ML. Colonnes dispo: {list(df.columns)}")
-
-df_model = df[base_cols].copy()
-df_model = df_model.replace([np.inf, -np.inf], np.nan)
-
-print(f"✓ Dataset ML (avant target): {df_model.shape}")
-if len(df_model) == 0:
-    raise ValueError("Dataset ML vide: vérifier les merges/colonnes source (fact_safetyroad / dim_zone)")
-
-# Créer la target binaire: risk_level (robuste)
-# Règle: high risk = au-dessus du 75e percentile d'au moins un indicateur disponible.
-df_model['risk_level'] = 0
-target_metrics = [c for c in ['volume', 'taux_1000', 'gravite_score', 'vulnerable_count'] if c in df_model.columns]
-
-if len(target_metrics) == 0:
-    print("⚠️ Aucun indicateur direct de risque (volume/taux/gravité/vulnérables). Target construite via un score proxy.")
-else:
-    for m in target_metrics:
-        thr = df_model[m].quantile(0.75)
-        if pd.isna(thr):
-            print(f"⚠️ Seuil p75 indisponible (NaN) pour {m}; ignoré.")
-            continue
-        df_model.loc[df_model[m] > thr, 'risk_level'] = 1
-        try:
-            print(f"  {m} threshold (p75): {float(thr):.4f}")
-        except Exception:
-            print(f"  {m} threshold (p75): {thr}")
-
-# Fallback si une seule classe (ex: colonnes majoritairement NaN)
-vc = df_model['risk_level'].value_counts(dropna=False)
-if vc.shape[0] < 2:
-    print("⚠️ Target non-séparable (1 seule classe). Construction d'un risk_score proxy pour générer 2 classes.")
-    proxy_feats = [c for c in target_metrics if df_model[c].notna().any()]
-    if not proxy_feats:
-        proxy_feats = [c for c in numeric_cols if c in df_model.columns and c not in ['year', 'month', 'zone_id'] and df_model[c].notna().any()]
-    if proxy_feats:
-        tmp = df_model[proxy_feats].copy()
-        tmp = tmp.apply(pd.to_numeric, errors='coerce')
-        tmp = tmp.fillna(tmp.median(numeric_only=True))
-        # score simple: moyenne des rangs percentiles
-        proxy_score = tmp.rank(pct=True).mean(axis=1)
-        df_model['risk_level'] = (proxy_score > proxy_score.quantile(0.75)).astype(int)
-    else:
-        print("⚠️ Impossible de construire un proxy de risque: pas de features numériques non-null.")
-
-print(f"\n✓ Target Distribution:")
-print(df_model['risk_level'].value_counts(dropna=False))
-
-# ============================
-# B — MODEL UNDERSTANDING (obligatoire)
-# ============================
-print("\n" + "=" * 70)
-print("🧠 COMPRÉHENSION DU MODÈLE (B)")
-print("=" * 70)
-print(
-    "On cherche à prédire un niveau de risque binaire (0/1) par zone et période. "
-    "Trois familles de modèles sont comparées:\n"
-    "- Régression Logistique: modèle linéaire probabiliste, interprétable via coefficients (hypothèse de séparation linéaire).\n"
-    "- Random Forest: ensemble d'arbres, capte non-linéarités et interactions, robuste aux outliers (limites: moins interprétable).\n"
-    "- SVM (RBF): capte des frontières non-linéaires, utile si séparation complexe (coût de calcul plus élevé).\n"
-    "Choix final basé sur F1 et ROC-AUC en validation." 
-)
-
-# ============================
-# A — DATA PREP & FEATURE ENGINEERING
-# ============================
-print("\n" + "=" * 70)
-print("🧹 DATA PREPARATION & FEATURE ENGINEERING (A)")
-print("=" * 70)
-
-# Définir features (numériques + catégorielles)
-target = 'risk_level'
-
-candidate_cat_cols = []
-for c in ['type', 'gravite', 'categorie', 'zone_nom']:
-    if c in df_model.columns:
-        candidate_cat_cols.append(c)
-
-candidate_num_cols = [c for c in numeric_cols if c in df_model.columns and c != target]
-
-feature_cols = candidate_num_cols + candidate_cat_cols
-X = df_model[feature_cols].copy()
-y = df_model[target].astype(int).values
-
-print(f"✓ Features numériques: {candidate_num_cols}")
-print(f"✓ Features catégorielles: {candidate_cat_cols}")
-print(f"✓ Target: {target} (positif=High risk)")
-
-# Feature selection (filter) simple: corrélation/MI sur numériques (reporting)
-if len(candidate_num_cols) >= 2:
-    try:
-        from sklearn.feature_selection import mutual_info_classif
-
-        tmp_num = df_model[candidate_num_cols].copy()
-        tmp_num = tmp_num.replace([np.inf, -np.inf], np.nan)
-        tmp_num = tmp_num.fillna(tmp_num.median(numeric_only=True))
-        mi = mutual_info_classif(tmp_num.values, y, random_state=42)
-        mi_df = pd.DataFrame({'feature': candidate_num_cols, 'mutual_info': mi}).sort_values('mutual_info', ascending=False)
-        print("\n🔎 Feature selection (Mutual Information) — top numériques:")
-        print(mi_df.head(10).to_string(index=False))
+        with model_path.open("rb") as f:
+            model = pickle.load(f)
+        with info_path.open("rb") as f:
+            info = pickle.load(f)
+        if not isinstance(info, ModelInfo):
+            return None, None
+        return model, info
     except Exception as e:
-        print(f"⚠️ Mutual information indisponible: {e}")
+        LOGGER.warning("Cache model load failed: %s", e)
+        return None, None
 
-numeric_pipeline = Pipeline(
-    steps=[
-        ('imputer', SimpleImputer(strategy='median')),
-        ('clip', QuantileClipper(lower_q=0.01, upper_q=0.99)),
-        ('scaler', RobustScaler()),
-    ]
-)
 
-categorical_pipeline = Pipeline(
-    steps=[
-        ('imputer', SimpleImputer(strategy='most_frequent')),
-        ('onehot', OneHotEncoder(handle_unknown='ignore')),
-    ]
-)
+def _save_cached(model: Pipeline, info: ModelInfo) -> None:
+    model_path, info_path = _cache_paths()
+    with model_path.open("wb") as f:
+        pickle.dump(model, f)
+    with info_path.open("wb") as f:
+        pickle.dump(info, f)
 
-preprocess = ColumnTransformer(
-    transformers=[
-        ('num', numeric_pipeline, candidate_num_cols),
-        ('cat', categorical_pipeline, candidate_cat_cols),
-    ],
-    remainder='drop'
-)
 
-# ============================
-# C — CLASSIFICATION: 3 modèles + tuning + comparaison
-# ============================
-print("\n" + "=" * 70)
-print("🎯 CLASSIFICATION (C) — 3 MODÈLES + TUNING + COMPARAISON")
-print("=" * 70)
+def _norm_text(x: Any) -> str:
+    s = "" if x is None else str(x)
+    s = s.strip().lower()
+    s = (
+        s.replace("é", "e")
+        .replace("è", "e")
+        .replace("ê", "e")
+        .replace("à", "a")
+        .replace("î", "i")
+        .replace("ï", "i")
+        .replace("ô", "o")
+        .replace("ù", "u")
+        .replace("ç", "c")
+    )
+    return s
 
-if len(X) == 0:
-    raise ValueError("Aucun échantillon disponible après préparation. Vérifier le chargement/merge des données.")
 
-# Split robuste: évite train vide et évite stratify si une seule classe / classe trop rare.
-n_samples = int(len(y))
-test_n = max(1, int(round(0.2 * n_samples)))
-if n_samples - test_n < 2:
-    test_n = max(1, n_samples - 2)
+def _gravite_to_risk(gravite: Any) -> int | None:
+    """Mappe une gravité accident en binaire.
 
-classes, counts = np.unique(y, return_counts=True)
-can_stratify = (len(classes) >= 2) and (counts.min() >= 2) and (test_n >= len(classes))
-stratify_arg = y if can_stratify else None
-if stratify_arg is None:
-    print("⚠️ Split sans stratification (dataset petit ou 1 classe).")
+    Retourne 1 si gravité sévère, 0 si non-sévère, None si inconnue.
+    """
+    s = _norm_text(gravite)
+    if not s or s in ("nan", "none", "n/a"):
+        return None
 
-X_train, X_test, y_train, y_test = train_test_split(
-    X, y, test_size=test_n, random_state=42, stratify=stratify_arg
-)
-print(f"✓ Train: {X_train.shape} | Test: {X_test.shape}")
-
-cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-
-pip_lr = Pipeline(
-    steps=[
-        ('prep', preprocess),
-        ('clf', LogisticRegression(max_iter=2000, class_weight='balanced')),
-    ]
-)
-grid_lr = {
-    'clf__C': [0.1, 1.0, 5.0],
-    'clf__penalty': ['l2'],
-    'clf__solver': ['lbfgs'],
-}
-
-pip_rf = Pipeline(
-    steps=[
-        ('prep', preprocess),
-        ('clf', RandomForestClassifier(class_weight='balanced', random_state=42)),
-    ]
-)
-grid_rf = {
-    'clf__n_estimators': [200, 400],
-    'clf__max_depth': [None, 8, 14],
-    'clf__min_samples_split': [2, 5],
-}
-
-pip_svm = Pipeline(
-    steps=[
-        ('prep', preprocess),
-        ('clf', SVC(class_weight='balanced', probability=True)),
-    ]
-)
-grid_svm = {
-    'clf__C': [0.5, 1.0, 5.0],
-    'clf__gamma': ['scale', 'auto'],
-    'clf__kernel': ['rbf'],
-}
-
-searches = [
-    ("LogisticRegression", GridSearchCV(pip_lr, grid_lr, cv=cv, scoring='f1', n_jobs=-1)),
-    ("RandomForest", GridSearchCV(pip_rf, grid_rf, cv=cv, scoring='f1', n_jobs=-1)),
-    ("SVM_RBF", GridSearchCV(pip_svm, grid_svm, cv=cv, scoring='f1', n_jobs=-1)),
-]
-
-results = []
-fitted_estimators: dict[str, Pipeline] = {}
-test_probabilities: dict[str, np.ndarray] = {}
-best_name = None
-best_est = None
-best_f1 = -1.0
-
-for name, search in searches:
-    print(f"\n🔎 GridSearchCV: {name} ...")
-    search.fit(X_train, y_train)
-    est = search.best_estimator_
-    fitted_estimators[name] = est
-    y_hat = est.predict(X_test)
-    y_proba = est.predict_proba(X_test)[:, 1] if hasattr(est, 'predict_proba') else None
-    if y_proba is not None:
-        test_probabilities[name] = y_proba
-
-    metrics_row = {
-        'model': name,
-        'best_params': search.best_params_,
-        'accuracy': accuracy_score(y_test, y_hat),
-        'precision': precision_score(y_test, y_hat, zero_division=0),
-        'recall': recall_score(y_test, y_hat, zero_division=0),
-        'f1': f1_score(y_test, y_hat, zero_division=0),
-        'roc_auc': roc_auc_score(y_test, y_proba) if y_proba is not None else np.nan,
+    severe = {
+        "tres grave",
+        "tres_grave",
+        "tresgrave",
+        "grave",
+        "eleve",
+        "elevé",
+        "mortel",
+        "fatal",
     }
-    results.append(metrics_row)
-    print(pd.Series(metrics_row).to_string())
+    mild = {
+        "faible",
+        "moyen",
+        "mineur",
+        "leger",
+        "legere",
+        "modere",
+        "moderé",
+    }
 
-    if metrics_row['f1'] > best_f1:
-        best_f1 = metrics_row['f1']
-        best_name = name
-        best_est = est
+    if s in severe:
+        return 1
+    if s in mild:
+        return 0
 
-results_df = pd.DataFrame(results).sort_values(['f1', 'roc_auc'], ascending=False)
-print("\n📌 Comparaison des modèles (test set):")
-print(results_df[['model', 'accuracy', 'precision', 'recall', 'f1', 'roc_auc']].to_string(index=False))
+    # Si on a un chiffre déguisé
+    try:
+        v = float(s)
+        return 1 if v >= 4 else 0
+    except Exception:
+        return None
 
-# Visualisation — comparaison multi-métriques
-try:
-    plot_df = results_df[['model', 'accuracy', 'precision', 'recall', 'f1', 'roc_auc']].copy()
-    plot_df = plot_df.melt(id_vars='model', var_name='metric', value_name='value')
-    plt.figure(figsize=(10, 5))
-    sns.barplot(data=plot_df, x='metric', y='value', hue='model')
-    plt.ylim(0, 1)
-    plt.title('Comparaison des modèles — métriques sur le test set')
-    plt.ylabel('Score')
-    plt.xlabel('Métrique')
-    plt.legend(title='Modèle', loc='lower right')
-    plt.tight_layout()
-    plt.savefig('Objectif3_Model_Comparison_Metrics.png', dpi=220, bbox_inches='tight')
-    plt.show()
-except Exception as e:
-    print(f"⚠️ Plot comparaison métriques indisponible: {e}")
-
-# Visualisation — ROC curves (tous les modèles avec proba)
-try:
-    plt.figure(figsize=(7, 6))
-    for model_name, proba in test_probabilities.items():
-        fpr_m, tpr_m, _ = roc_curve(y_test, proba)
-        auc_m = auc(fpr_m, tpr_m)
-        plt.plot(fpr_m, tpr_m, linewidth=2, label=f"{model_name} (AUC={auc_m:.3f})")
-    plt.plot([0, 1], [0, 1], linestyle='--', color='gray')
-    plt.title('ROC — comparaison des modèles')
-    plt.xlabel('False Positive Rate')
-    plt.ylabel('True Positive Rate')
-    plt.legend(loc='lower right')
-    plt.tight_layout()
-    plt.savefig('Objectif3_ROC_Comparison.png', dpi=220, bbox_inches='tight')
-    plt.show()
-except Exception as e:
-    print(f"⚠️ Plot ROC comparaison indisponible: {e}")
-
-if best_est is None or best_name is None:
-    raise RuntimeError("Aucun modèle n'a pu être entraîné")
-
-print(f"\n✅ Modèle retenu: {best_name} (F1={best_f1:.3f})")
 
 # ============================
-# Interprétation & Visualisations (C)
+# DATA LOADING / PREP
 # ============================
-print("\n📈 VISUALISATIONS (ROC + MATRICE DE CONFUSION + IMPORTANCE)")
-
-best_pred = best_est.predict(X_test)
-best_proba = best_est.predict_proba(X_test)[:, 1]
-
-cm = confusion_matrix(y_test, best_pred)
-plt.figure(figsize=(6, 5))
-sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', cbar=False)
-plt.title(f"Matrice de confusion — {best_name}")
-plt.xlabel('Prédit')
-plt.ylabel('Réel')
-plt.tight_layout()
-plt.savefig('Objectif3_ConfusionMatrix.png', dpi=200, bbox_inches='tight')
-plt.show()
-
-fpr, tpr, _ = roc_curve(y_test, best_proba)
-roc_auc = auc(fpr, tpr)
-plt.figure(figsize=(6, 5))
-plt.plot(fpr, tpr, label=f"ROC (AUC={roc_auc:.3f})", linewidth=2)
-plt.plot([0, 1], [0, 1], linestyle='--', color='gray')
-plt.title(f"Courbe ROC — {best_name}")
-plt.xlabel('False Positive Rate')
-plt.ylabel('True Positive Rate')
-plt.legend(loc='lower right')
-plt.tight_layout()
-plt.savefig('Objectif3_ROC.png', dpi=200, bbox_inches='tight')
-plt.show()
-
-# Feature importance / coefficients
-try:
-    prep = best_est.named_steps['prep']
-    clf = best_est.named_steps['clf']
-    feature_names = prep.get_feature_names_out()
-    if hasattr(clf, 'feature_importances_'):
-        importances = clf.feature_importances_
-        imp = pd.DataFrame({'feature': feature_names, 'importance': importances}).sort_values('importance', ascending=False).head(20)
-        plt.figure(figsize=(10, 6))
-        sns.barplot(data=imp, y='feature', x='importance', color='#4c72b0')
-        plt.title(f"Top 20 Feature Importance — {best_name}")
-        plt.tight_layout()
-        plt.savefig('Objectif3_FeatureImportance.png', dpi=200, bbox_inches='tight')
-        plt.show()
-        print("\nTop features (RF importance):")
-        print(imp.to_string(index=False))
-    elif hasattr(clf, 'coef_'):
-        coefs = clf.coef_.ravel()
-        coef_df = pd.DataFrame({'feature': feature_names, 'coef': coefs})
-        coef_df['abs_coef'] = coef_df['coef'].abs()
-        top = coef_df.sort_values('abs_coef', ascending=False).head(20)
-        plt.figure(figsize=(10, 6))
-        sns.barplot(data=top, y='feature', x='coef', palette='vlag')
-        plt.title(f"Top 20 Coefficients — {best_name}")
-        plt.tight_layout()
-        plt.savefig('Objectif3_Coefficients.png', dpi=200, bbox_inches='tight')
-        plt.show()
-        print("\nTop features (LR coefficients):")
-        print(top[['feature', 'coef']].to_string(index=False))
-except Exception as e:
-    print(f"⚠️ Feature importance indisponible: {e}")
-
-# ============ 📅 GÉNÉRER LES PRÉDICTIONS FUTURES (36 MOIS) ============
-print("\n" + "="*70)
-print("📅 GÉNÉRATION DES PRÉDICTIONS RISK LEVEL (36 MOIS)")
-print("="*70)
-
-max_date = df_model['date'].max()
-zones_uniques = sorted(df_model['zone_id'].dropna().unique())
-
-print(f"✓ Zones trouvées: {len(zones_uniques)} zones")
-print(f"✓ Max date: {max_date}")
-
-# Générer 36 mois futurs
-future_dates = pd.date_range(start=max_date + timedelta(days=1), periods=36, freq='MS')
-
-predictions_list = []
-
-for date in future_dates:
-    year = date.year
-    month = date.month
-    
-    for zone in zones_uniques:
-        zone_mask = df_model['zone_id'] == zone
-        zone_data = df_model.loc[zone_mask]
-
-        if len(zone_data) == 0:
-            continue
-
-        # Construire une ligne de features future en se basant sur les stats historiques de la zone
-        row = {}
-        for col in candidate_num_cols:
-            if col == 'year':
-                row[col] = year
-            elif col == 'month':
-                row[col] = month
-            elif col == 'zone_id':
-                row[col] = zone
-            else:
-                row[col] = float(zone_data[col].median()) if col in zone_data.columns else np.nan
-
-        for col in candidate_cat_cols:
-            if col in zone_data.columns:
-                row[col] = zone_data[col].mode().iloc[0] if zone_data[col].notna().any() else 'N/A'
-            else:
-                row[col] = 'N/A'
-
-        feature_row = pd.DataFrame([row], columns=feature_cols)
-
-        risk_pred = int(best_est.predict(feature_row)[0])
-        risk_score = float(best_est.predict_proba(feature_row)[0][1])
-        zone_nom = zone_data['zone_nom'].iloc[0] if 'zone_nom' in zone_data.columns else f"Zone_{int(zone)}"
-
-        predictions_list.append(
-            {
-                'zone_id': int(zone),
-                'zone_nom': zone_nom,
-                'année': year,
-                'mois': month,
-                'date': date,
-                'risk_level': risk_pred,
-                'risk_score': risk_score,
-            }
+def _load_from_db() -> pd.DataFrame:
+    if not _db_enabled():
+        raise RuntimeError(
+            "Connexion PostgreSQL non configurée. Variables requises: "
+            "DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD."
         )
 
-predictions_df = pd.DataFrame(predictions_list)
+    schema = os.getenv("DB_SCHEMA", "public")
 
-print(f"\n✓ {len(predictions_df)} prédictions de risque générées")
-print(f"✓ Période: {predictions_df['date'].min()} à {predictions_df['date'].max()}")
-print(f"\nAperçu:")
-print(predictions_df.head(15))
+    fact_table = _resolve_table(
+        preferred=os.getenv("FACT_SAFETYROAD_TABLE", "fact_safetyroad"),
+        schema=schema,
+        like_patterns=["fact_safety%", "fact_safe%", "fact_safetyroad%"],
+    )
+    if fact_table is None:
+        raise RuntimeError(f"Table fact_safetyroad introuvable dans le schéma {schema}.")
 
-# ============ 📊 STATISTIQUES ============
-print("\n" + "="*70)
-print("📊 STATISTIQUES DES PRÉDICTIONS DE RISQUE")
-print("="*70)
+    dim_zone_table = _resolve_table(
+        preferred=os.getenv("DIM_ZONE_TABLE", "dim_zone"),
+        schema=schema,
+        like_patterns=["dim_zone%"],
+    )
+    if dim_zone_table is None:
+        raise RuntimeError(f"Table dim_zone introuvable dans le schéma {schema}.")
 
-print(f"\nRisk Level Distribution:")
-risk_dist = predictions_df['risk_level'].value_counts().sort_index()
-print(f"  Low Risk (0): {(predictions_df['risk_level'] == 0).sum()}")
-print(f"  High Risk (1): {(predictions_df['risk_level'] == 1).sum()}")
-
-print(f"\nRisk Score Stats:")
-print(f"  Min: {predictions_df['risk_score'].min():.4f}")
-print(f"  Max: {predictions_df['risk_score'].max():.4f}")
-print(f"  Moyenne: {predictions_df['risk_score'].mean():.4f}")
-print(f"  Médiane: {predictions_df['risk_score'].median():.4f}")
-
-print(f"\n📍 Risk par zone (score moyen):")
-zone_stats = predictions_df.groupby('zone_nom')['risk_score'].agg(['mean', 'count']).sort_values('mean', ascending=False)
-print(zone_stats)
-
-# ============ 📈 VISUALISATIONS ============
-print("\n📈 GÉNÉRATION DES VISUALISATIONS...")
-
-fig = plt.figure(figsize=(18, 12))
-gs = fig.add_gridspec(3, 2, hspace=0.35, wspace=0.3)
-
-# Plot 1: Risk Score Evolution - 36 mois
-ax = fig.add_subplot(gs[0, 0])
-risk_monthly = predictions_df.groupby('date')['risk_score'].agg(['mean', 'std'])
-ax.plot(risk_monthly.index, risk_monthly['mean'], marker='o', linewidth=2.5, color='darkred', label='Risk Score')
-ax.fill_between(
-    risk_monthly.index,
-    risk_monthly['mean'] - risk_monthly['std'],
-    risk_monthly['mean'] + risk_monthly['std'],
-    alpha=0.2,
-    color='red',
-    label='±Std Dev',
-)
-ax.set_xlabel('Date', fontsize=11, fontweight='bold')
-ax.set_ylabel('Risk Score', fontsize=11, fontweight='bold')
-ax.set_title('Évolution du Risk Score - 36 Mois', fontsize=12, fontweight='bold')
-ax.axhline(y=0.5, color='orange', linestyle='--', alpha=0.7, linewidth=2, label='Seuil High Risk')
-ax.legend(loc='best')
-ax.grid(alpha=0.3)
-plt.setp(ax.xaxis.get_majorticklabels(), rotation=45)
-ax.set_ylim([-0.05, 1.05])
-
-# Plot 2: Risk Score par zone (Top 10)
-ax = fig.add_subplot(gs[0, 1])
-zone_risk = predictions_df.groupby('zone_nom')['risk_score'].mean().sort_values(ascending=False).head(10)
-colors = ['#d73027' if x > 0.65 else '#fee090' if x > 0.35 else '#91bfdb' for x in zone_risk.values]
-bars = ax.barh(range(len(zone_risk)), zone_risk.values, color=colors, alpha=0.8, edgecolor='black', linewidth=1.5)
-ax.set_yticks(range(len(zone_risk)))
-ax.set_yticklabels(zone_risk.index, fontsize=10)
-ax.set_xlabel('Risk Score Moyen', fontsize=11, fontweight='bold')
-ax.set_title('Risk Score par Zone (Top 10)', fontsize=12, fontweight='bold')
-ax.axvline(x=0.5, color='red', linestyle='--', alpha=0.6, linewidth=2)
-ax.grid(axis='x', alpha=0.3)
-for i, (bar, val) in enumerate(zip(bars, zone_risk.values)):
-    ax.text(val + 0.02, i, f'{val:.2f}', va='center', fontsize=9, fontweight='bold')
-
-# Plot 3: Distribution Risk Level
-ax = fig.add_subplot(gs[1, 0])
-risk_counts = predictions_df['risk_level'].value_counts()
-labels_pie = [
-    f"Low Risk\n({risk_counts.get(0, 0)} prédictions)" if i == 0 else f"High Risk\n({risk_counts.get(1, 0)} prédictions)"
-    for i in sorted(risk_counts.index)
-]
-colors_pie = ['#91bfdb', '#d73027']
-ax.pie(
-    risk_counts.sort_index().values,
-    labels=labels_pie,
-    autopct='%1.1f%%',
-    colors=colors_pie,
-    startangle=90,
-    textprops={'fontsize': 10, 'fontweight': 'bold'},
-)
-ax.set_title('Distribution Risk Level', fontsize=12, fontweight='bold')
-
-# Plot 4: Saisonnalité Risk (par mois)
-ax = fig.add_subplot(gs[1, 1])
-risk_monthly_pattern = predictions_df.groupby('mois')['risk_score'].mean()
-mois_labels = ['Jan', 'Fév', 'Mar', 'Avr', 'Mai', 'Juin', 'Juil', 'Aoû', 'Sep', 'Oct', 'Nov', 'Déc']
-ax.plot(
-    risk_monthly_pattern.index,
-    risk_monthly_pattern.values,
-    marker='o',
-    linewidth=2.5,
-    color='darkred',
-    markersize=8,
-    label='Risk Score',
-)
-ax.fill_between(risk_monthly_pattern.index, risk_monthly_pattern.values, alpha=0.2, color='red')
-ax.set_xlabel('Mois', fontsize=11, fontweight='bold')
-ax.set_ylabel('Risk Score Moyen', fontsize=11, fontweight='bold')
-ax.set_title('Saisonnalité - Risk par Mois', fontsize=12, fontweight='bold')
-ax.set_xticks(range(1, 13))
-ax.set_xticklabels(mois_labels, rotation=45)
-ax.axhline(y=0.5, color='orange', linestyle='--', alpha=0.5, linewidth=2)
-ax.grid(alpha=0.3)
-
-# Plot 5: Risk par année
-ax = fig.add_subplot(gs[2, 0])
-risk_yearly = predictions_df.groupby('année')['risk_score'].mean()
-bars = ax.bar(
-    risk_yearly.index.astype(str),
-    risk_yearly.values,
-    color='#d73027',
-    alpha=0.7,
-    edgecolor='black',
-    linewidth=1.5,
-)
-ax.set_xlabel('Année', fontsize=11, fontweight='bold')
-ax.set_ylabel('Risk Score Moyen', fontsize=11, fontweight='bold')
-ax.set_title('Risk Score par Année', fontsize=12, fontweight='bold')
-ax.axhline(y=0.5, color='orange', linestyle='--', alpha=0.6, linewidth=2)
-ax.grid(axis='y', alpha=0.3)
-for bar, val in zip(bars, risk_yearly.values):
-    height = bar.get_height()
-    ax.text(
-        bar.get_x() + bar.get_width() / 2.0,
-        height,
-        f'{val:.3f}',
-        ha='center',
-        va='bottom',
-        fontsize=10,
-        fontweight='bold',
+    dim_acc_table = _resolve_table(
+        preferred=os.getenv("DIM_ACCIDENTS_TABLE", "dim_accidents"),
+        schema=schema,
+        like_patterns=["dim_accident%", "dim_accidents%"],
+    )
+    dim_del_table = _resolve_table(
+        preferred=os.getenv("DIM_DELINQUENCE_TABLE", "dim_delinquence"),
+        schema=schema,
+        like_patterns=["dim_delin%", "dim_crime%", "dim_delinquence%"],
     )
 
-# Plot 6: Heatmap Zone x Mois
-ax = fig.add_subplot(gs[2, 1])
-pivot_data = predictions_df.pivot_table(values='risk_score', index='zone_nom', columns='mois', aggfunc='mean')
-sns.heatmap(
-    pivot_data,
-    cmap='RdYlGn_r',
-    cbar_kws={'label': 'Risk Score'},
-    ax=ax,
-    linewidths=0.5,
-    linecolor='gray',
-    vmin=0,
-    vmax=1,
-)
-ax.set_title('Heatmap: Risk Score par Zone et Mois', fontsize=12, fontweight='bold')
-ax.set_xlabel('Mois', fontsize=10, fontweight='bold')
-ax.set_ylabel('Zone', fontsize=10, fontweight='bold')
+    fact_safetyroad = _read_table(fact_table, schema=schema)
+    dim_zone = _read_table(dim_zone_table, schema=schema)
+    dim_accidents = _read_table(dim_acc_table, schema=schema) if dim_acc_table else None
+    dim_delinquence = _read_table(dim_del_table, schema=schema) if dim_del_table else None
 
-plt.savefig('Objectif3_Classifications_Risque_Professional.png', dpi=300, bbox_inches='tight')
-print("✓ Visualisations sauvegardées")
-plt.show()
+    df = fact_safetyroad.copy()
+    if len(df) == 0:
+        raise ValueError("Aucune donnée disponible: fact_safetyroad est vide")
 
-print("\n✅ OBJECTIF 3 TERMINÉ!")
-print("=" * 70)
+    # Harmoniser types clés
+    for k in ["fk_zone", "fk_accident", "fk_crime"]:
+        if k in df.columns:
+            df[k] = pd.to_numeric(df[k], errors="coerce").astype("Int64")
+
+    if "zone_id" in dim_zone.columns:
+        dim_zone["zone_id"] = pd.to_numeric(dim_zone["zone_id"], errors="coerce").astype("Int64")
+
+    if dim_accidents is not None and "accident_id" in dim_accidents.columns:
+        dim_accidents["accident_id"] = pd.to_numeric(dim_accidents["accident_id"], errors="coerce").astype("Int64")
+
+    if dim_delinquence is not None and "crime_id" in dim_delinquence.columns:
+        dim_delinquence["crime_id"] = pd.to_numeric(dim_delinquence["crime_id"], errors="coerce").astype("Int64")
+        if "periode_mois" in dim_delinquence.columns and "date" not in dim_delinquence.columns:
+            pm = dim_delinquence["periode_mois"].astype(str).str.replace(r"\D", "", regex=True).str.slice(0, 6)
+            dim_delinquence["date"] = pd.to_datetime(pm, format="%Y%m", errors="coerce")
+
+    # Merge dim_zone
+    zone_name_col = "zone_nom" if "zone_nom" in dim_zone.columns else ("zone_name" if "zone_name" in dim_zone.columns else None)
+    zone_keep_cols = ["zone_id"] + ([zone_name_col] if zone_name_col else [])
+    if "fk_zone" in df.columns and "zone_id" in dim_zone.columns:
+        df = df.merge(dim_zone[zone_keep_cols], left_on="fk_zone", right_on="zone_id", how="left")
+    else:
+        if "zone_id" not in df.columns:
+            df["zone_id"] = 1
+        if zone_name_col and zone_name_col not in df.columns:
+            df[zone_name_col] = df["zone_id"].apply(lambda z: f"Zone_{z}")
+
+    if zone_name_col is None:
+        df["zone_nom"] = df.get("zone_nom", df.get("zone_name", "Zone"))
+    else:
+        if zone_name_col != "zone_nom":
+            df["zone_nom"] = df[zone_name_col]
+
+    # Merge dim_accidents
+    if dim_accidents is not None and "fk_accident" in df.columns and "accident_id" in dim_accidents.columns:
+        keep = ["accident_id"]
+        for c in ["type", "gravite", "severity", "accident_type"]:
+            if c in dim_accidents.columns:
+                keep.append(c)
+        df = df.merge(dim_accidents[keep], left_on="fk_accident", right_on="accident_id", how="left")
+
+    # Merge dim_delinquence
+    if dim_delinquence is not None and "fk_crime" in df.columns and "crime_id" in dim_delinquence.columns:
+        keep = ["crime_id"]
+        for c in ["periode_mois", "categorie", "category", "date"]:
+            if c in dim_delinquence.columns:
+                keep.append(c)
+        df = df.merge(dim_delinquence[keep], left_on="fk_crime", right_on="crime_id", how="left")
+
+    return df
+
+
+def _make_time_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    if "date" in df.columns and pd.to_datetime(df["date"], errors="coerce").notna().any():
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    elif "periode_mois" in df.columns and df["periode_mois"].notna().any():
+        pm = df["periode_mois"].astype(str).str.replace(r"\D", "", regex=True).str.slice(0, 6)
+        df["date"] = pd.to_datetime(pm, format="%Y%m", errors="coerce")
+        if df["date"].isna().all():
+            df["date"] = pd.date_range("2023-01-01", periods=len(df), freq="D")
+    else:
+        df["date"] = pd.date_range("2023-01-01", periods=len(df), freq="D")
+
+    df["year"] = df["date"].dt.year
+    df["month"] = df["date"].dt.month
+    return df
+
+
+def _build_features(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str], list[str]]:
+    """Retourne df_model + listes (num_cols, cat_cols) utilisables."""
+    df = _make_time_columns(df)
+
+    def to_float(col: str) -> pd.Series:
+        s = df[col]
+        if pd.api.types.is_numeric_dtype(s):
+            return pd.to_numeric(s, errors="coerce")
+        # Supporte virgule décimale + séparateurs divers
+        s2 = s.astype(str).str.strip().str.replace(" ", "")
+        s2 = s2.str.replace(",", ".", regex=False)
+        return pd.to_numeric(s2, errors="coerce")
+
+    numeric_cols: list[str] = []
+    if "volume" in df.columns:
+        df["volume"] = to_float("volume")
+        numeric_cols.append("volume")
+    if "taux_1000" in df.columns:
+        df["taux_1000"] = to_float("taux_1000")
+        numeric_cols.append("taux_1000")
+
+    if "gravite" in df.columns:
+        gravite_map = {"faible": 1, "moyen": 2, "élevé": 3, "grave": 4, "très grave": 5}
+        df["gravite_score"] = df["gravite"].map(gravite_map).fillna(2)
+        numeric_cols.append("gravite_score")
+
+    if "usager_vulnerable" in df.columns:
+        df["vulnerable_count"] = pd.to_numeric(df["usager_vulnerable"], errors="coerce").fillna(0)
+        numeric_cols.append("vulnerable_count")
+
+    for c in ["year", "month", "zone_id"]:
+        if c in df.columns and c not in numeric_cols:
+            numeric_cols.append(c)
+
+    cat_cols: list[str] = []
+    for c in ["type", "gravite", "categorie", "zone_nom"]:
+        if c in df.columns:
+            cat_cols.append(c)
+
+    base_cols = list(dict.fromkeys(numeric_cols + cat_cols + ["date"]))
+    base_cols = [c for c in base_cols if c in df.columns]
+    if not base_cols:
+        raise ValueError(f"Aucune colonne utilisable pour le ML. Colonnes dispo: {list(df.columns)}")
+    df_model = df[base_cols].copy().replace([np.inf, -np.inf], np.nan)
+
+    if FAST_MODE and len(df_model) > 5000:
+        df_model = df_model.sample(5000, random_state=42)
+
+    return df_model, numeric_cols, cat_cols
+
+
+def _compute_thresholds(train_df: pd.DataFrame, metrics: list[str], q: float = 0.75) -> dict[str, float]:
+    thresholds: dict[str, float] = {}
+    for m in metrics:
+        if m not in train_df.columns:
+            continue
+        ser = pd.to_numeric(train_df[m], errors="coerce")
+        thr = ser.quantile(q)
+        if pd.isna(thr):
+            continue
+        thresholds[m] = float(thr)
+    return thresholds
+
+
+def _apply_threshold_target(df: pd.DataFrame, thresholds: dict[str, float]) -> np.ndarray:
+    if not thresholds:
+        return np.zeros(len(df), dtype=int)
+    y = np.zeros(len(df), dtype=int)
+    for m, thr in thresholds.items():
+        ser = pd.to_numeric(df[m], errors="coerce")
+        y = np.maximum(y, (ser > thr).astype(int).to_numpy())
+    return y.astype(int)
+
+
+def _ensure_two_classes(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    candidate_metrics: list[str],
+) -> tuple[np.ndarray, np.ndarray, dict[str, float], list[str]]:
+    """Construit y_train/y_test. Fallback proxy si 1 seule classe."""
+    thresholds = _compute_thresholds(train_df, candidate_metrics, q=0.75)
+    y_train = _apply_threshold_target(train_df, thresholds)
+    y_test = _apply_threshold_target(test_df, thresholds)
+
+    if len(np.unique(y_train)) >= 2:
+        return y_train, y_test, thresholds, list(thresholds.keys())
+
+    # Fallback: proxy score basé sur rangs percentiles (train uniquement)
+    proxy_feats = [c for c in candidate_metrics if c in train_df.columns and train_df[c].notna().any()]
+    if not proxy_feats:
+        proxy_feats = [c for c in train_df.columns if c not in ("date",) and train_df[c].dtype != object]
+    if not proxy_feats:
+        return y_train, y_test, thresholds, list(thresholds.keys())
+
+    tmp_train = train_df[proxy_feats].apply(pd.to_numeric, errors="coerce")
+    tmp_train = tmp_train.fillna(tmp_train.median(numeric_only=True))
+    proxy_score_train = tmp_train.rank(pct=True).mean(axis=1)
+    proxy_thr = float(proxy_score_train.quantile(0.75))
+
+    tmp_test = test_df[proxy_feats].apply(pd.to_numeric, errors="coerce")
+    tmp_test = tmp_test.fillna(tmp_train.median(numeric_only=True))
+    proxy_score_test = tmp_test.rank(pct=True).mean(axis=1)
+
+    y_train = (proxy_score_train > proxy_thr).astype(int).to_numpy()
+    y_test = (proxy_score_test > proxy_thr).astype(int).to_numpy()
+    thresholds = {"proxy_score": proxy_thr}
+    return y_train, y_test, thresholds, ["proxy_score"]
+
+
+def _build_preprocess(num_cols: list[str], cat_cols: list[str]) -> ColumnTransformer:
+    numeric_pipeline = Pipeline(
+        steps=[
+            ("imputer", SimpleImputer(strategy="median")),
+            ("clip", QuantileClipper(lower_q=0.01, upper_q=0.99)),
+            ("scaler", RobustScaler()),
+        ]
+    )
+
+    categorical_pipeline = Pipeline(
+        steps=[
+            ("imputer", SimpleImputer(strategy="most_frequent")),
+            ("onehot", OneHotEncoder(handle_unknown="ignore")),
+        ]
+    )
+
+    return ColumnTransformer(
+        transformers=[
+            ("num", numeric_pipeline, num_cols),
+            ("cat", categorical_pipeline, cat_cols),
+        ],
+        remainder="drop",
+    )
+
+
+# ============================
+# TRAINING
+# ============================
+def _train_models(X_train: pd.DataFrame, y_train: np.ndarray, X_test: pd.DataFrame, y_test: np.ndarray, preprocess: ColumnTransformer):
+    cv = StratifiedKFold(n_splits=(3 if FAST_MODE else 5), shuffle=True, random_state=42)
+
+    pip_lr = Pipeline(
+        steps=[
+            ("prep", preprocess),
+            ("clf", LogisticRegression(max_iter=2000, class_weight="balanced")),
+        ]
+    )
+    grid_lr = {
+        "clf__C": ([1.0, 5.0] if FAST_MODE else [0.1, 1.0, 5.0]),
+        "clf__penalty": ["l2"],
+        "clf__solver": ["lbfgs"],
+    }
+
+    pip_rf = Pipeline(
+        steps=[
+            ("prep", preprocess),
+            ("clf", RandomForestClassifier(class_weight="balanced", random_state=42)),
+        ]
+    )
+    grid_rf = {
+        "clf__n_estimators": ([200] if FAST_MODE else [200, 400]),
+        "clf__max_depth": ([None, 14] if FAST_MODE else [None, 8, 14]),
+        "clf__min_samples_split": ([2, 5] if FAST_MODE else [2, 5]),
+    }
+
+    pip_svm = Pipeline(
+        steps=[
+            ("prep", preprocess),
+            ("clf", SVC(class_weight="balanced", probability=True)),
+        ]
+    )
+    grid_svm = {
+        "clf__C": ([1.0] if FAST_MODE else [0.5, 1.0, 5.0]),
+        "clf__gamma": (["scale"] if FAST_MODE else ["scale", "auto"]),
+        "clf__kernel": ["rbf"],
+    }
+
+    searches = [
+        ("LogisticRegression", GridSearchCV(pip_lr, grid_lr, cv=cv, scoring="f1", n_jobs=-1)),
+        ("RandomForest", GridSearchCV(pip_rf, grid_rf, cv=cv, scoring="f1", n_jobs=-1)),
+        ("SVM_RBF", GridSearchCV(pip_svm, grid_svm, cv=cv, scoring="f1", n_jobs=-1)),
+    ]
+
+    results: list[dict[str, Any]] = []
+    best_name: str | None = None
+    best_est: Pipeline | None = None
+    best_f1 = -1.0
+
+    for name, search in searches:
+        LOGGER.info("GridSearchCV: %s", name)
+        search.fit(X_train, y_train)
+        est: Pipeline = search.best_estimator_
+        y_hat = est.predict(X_test)
+        y_proba = est.predict_proba(X_test)[:, 1]
+
+        row = {
+            "model": name,
+            "best_params": search.best_params_,
+            "accuracy": float(accuracy_score(y_test, y_hat)),
+            "precision": float(precision_score(y_test, y_hat, zero_division=0)),
+            "recall": float(recall_score(y_test, y_hat, zero_division=0)),
+            "f1": float(f1_score(y_test, y_hat, zero_division=0)),
+            "roc_auc": float(roc_auc_score(y_test, y_proba)) if len(np.unique(y_test)) >= 2 else float("nan"),
+            "confusion_matrix": confusion_matrix(y_test, y_hat, labels=[0, 1]).tolist(),
+        }
+        results.append(row)
+
+        if row["f1"] > best_f1:
+            best_f1 = row["f1"]
+            best_name = name
+            best_est = est
+
+    if best_est is None or best_name is None:
+        raise RuntimeError("Aucun modèle n'a pu être entraîné")
+
+    results_sorted = sorted(results, key=lambda r: (r["f1"], (r["roc_auc"] if not np.isnan(r["roc_auc"]) else -1.0)), reverse=True)
+    return best_name, best_est, best_f1, results_sorted
+
+
+def train_and_cache(force: bool = False) -> tuple[Pipeline, ModelInfo]:
+    cached_model, cached_info = _load_cached()
+    if cached_model is not None and cached_info is not None and not force:
+        return cached_model, cached_info
+
+    LOGGER.info("Training Objective3 models (FAST_MODE=%s)", FAST_MODE)
+    df_raw = _load_from_db()
+    df_model, numeric_cols, cat_cols = _build_features(df_raw)
+
+    # ===== Target + features (anti-leakage) =====
+    # 1) Mode préféré: label basé sur la gravité (plus logique), et on retire gravite/gravite_score des features.
+    target_mode = "quantile"  # fallback
+    target_definition = ""
+    thresholds: dict[str, float] = {}
+    used_metrics: list[str] = []
+
+    grav_ok = False
+    if "gravite" in df_model.columns:
+        y_all = df_model["gravite"].map(_gravite_to_risk)
+        y_all = y_all.dropna()
+        if len(y_all) >= 100:
+            classes, counts = np.unique(y_all.astype(int).to_numpy(), return_counts=True)
+            if len(classes) >= 2 and counts.min() >= 10:
+                grav_ok = True
+
+    if grav_ok:
+        target_mode = "gravite"
+        target_definition = (
+            "risk_level=1 si la gravité accident est sévère (grave/très grave/élevé/mortel), "
+            "sinon 0. Les lignes sans gravité sont ignorées pour l'entraînement."
+        )
+        y_series = df_model["gravite"].map(_gravite_to_risk)
+        mask = y_series.notna()
+        y_all = y_series.loc[mask].astype(int).to_numpy()
+
+        # features: tout sauf la colonne label et ses dérivés
+        feature_cols = [c for c in (numeric_cols + cat_cols) if c in df_model.columns]
+        for drop_col in ["gravite", "gravite_score"]:
+            if drop_col in feature_cols:
+                feature_cols.remove(drop_col)
+
+        X_all = df_model.loc[mask, feature_cols].copy()
+
+        if len(X_all) < 50:
+            raise ValueError("Pas assez de données avec gravité pour entraîner un modèle (min 50 lignes).")
+
+        # Split avec stratify si possible
+        classes, counts = np.unique(y_all, return_counts=True)
+        stratify_arg = y_all if (len(classes) >= 2 and counts.min() >= 2) else None
+        X_train, X_test, y_train, y_test = train_test_split(
+            X_all,
+            y_all,
+            test_size=0.2,
+            random_state=42,
+            stratify=stratify_arg,
+        )
+        used_metrics = ["gravite"]
+    else:
+        # 2) Fallback: quantile-based sur taux_1000 (seuils calculés sur train), ET on retire taux_1000 des features.
+        target_mode = "quantile"
+        target_definition = (
+            "risk_level=1 si au-dessus du P75 (calculé sur train) d'au moins un indicateur de risque; "
+            "par défaut: taux_1000 si disponible."
+        )
+
+        # features: éviter la tautologie -> on retire taux_1000 des features si utilisé pour créer la target.
+        feature_cols = [c for c in (numeric_cols + cat_cols) if c in df_model.columns]
+        if "taux_1000" in feature_cols:
+            feature_cols.remove("taux_1000")
+
+        X_all = df_model[feature_cols].copy()
+        if len(X_all) < 50:
+            raise ValueError("Pas assez de données pour entraîner un modèle (min 50 lignes).")
+
+        X_train, X_test = train_test_split(X_all, test_size=0.2, random_state=42)
+        candidate_metrics = [c for c in ["taux_1000", "vulnerable_count"] if c in df_model.columns]
+        y_train, y_test, thresholds, used_metrics = _ensure_two_classes(
+            train_df=df_model.loc[X_train.index],
+            test_df=df_model.loc[X_test.index],
+            candidate_metrics=candidate_metrics,
+        )
+        if len(np.unique(y_train)) < 2:
+            raise ValueError("La target 'risk_level' ne contient qu'une seule classe après construction.")
+
+    # Preprocess: num vs cat
+    num_cols = [c for c in numeric_cols if c in feature_cols]
+    cat_cols2 = [c for c in cat_cols if c in feature_cols]
+    preprocess = _build_preprocess(num_cols=num_cols, cat_cols=cat_cols2)
+
+    best_name, best_est, best_f1, results_sorted = _train_models(
+        X_train=X_train,
+        y_train=y_train,
+        X_test=X_test,
+        y_test=y_test,
+        preprocess=preprocess,
+    )
+
+    info = ModelInfo(
+        best_model=best_name,
+        best_f1=float(best_f1),
+        metrics=results_sorted,
+        feature_cols=feature_cols,
+        num_cols=num_cols,
+        cat_cols=cat_cols2,
+        target_mode=target_mode,
+        target_definition=target_definition,
+        target_thresholds=thresholds,
+        target_metrics=used_metrics,
+        trained_at=_now_iso(),
+    )
+
+    _save_cached(best_est, info)
+    return best_est, info
+
+
+# ============================
+# API ENTRYPOINT
+# ============================
+def run_Classification(input_data: dict[str, Any] | None = None, *, force_retrain: bool = False) -> dict[str, Any]:
+    """Fonction appelée par l'API.
+
+    - Si input_data est fourni: prédit le risque pour une observation.
+    - Sinon: utilise un exemple par défaut.
+    """
+
+    try:
+        model, info = train_and_cache(force=force_retrain)
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": str(e),
+            "timestamp": _now_iso(),
+        }
+
+    if input_data is None:
+        # Valeurs par défaut cohérentes avec les données DB (taux_1000 ~ 0.6–1.0)
+        input_data = {"volume": 1500, "taux_1000": 0.8}
+
+    # Construire une ligne avec toutes les colonnes attendues par le pipeline
+    row: dict[str, Any] = {}
+    for c in info.feature_cols:
+        v = input_data.get(c, np.nan)
+        if c in info.num_cols and v is not np.nan:
+            if isinstance(v, str):
+                v = v.strip().replace(" ", "").replace(",", ".")
+            try:
+                v = float(v)
+            except Exception:
+                v = np.nan
+        row[c] = v
+    X_one = pd.DataFrame([row], columns=info.feature_cols)
+
+    try:
+        pred = int(model.predict(X_one)[0])
+        proba = float(model.predict_proba(X_one)[0][1])
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"Prediction failed: {e}",
+            "timestamp": _now_iso(),
+            "expected_features": info.feature_cols,
+        }
+
+    return {
+        "status": "success",
+        "model": info.best_model,
+        "f1_score": float(info.best_f1),
+        "input": input_data,
+        "prediction": pred,
+        "risk_score": proba,
+        "risk_level": "HIGH" if pred == 1 else "LOW",
+        "trained_at": info.trained_at,
+        "timestamp": _now_iso(),
+        # Rétrocompat / debug
+        "all_models": info.metrics,
+        "target": {
+            "mode": info.target_mode,
+            "definition": info.target_definition,
+            "metrics_used": info.target_metrics,
+            "thresholds": info.target_thresholds,
+        },
+    }
+
+
+def mlops_export_latest(*, force_retrain: bool = False) -> dict[str, Any]:
+    """Exporte le meilleur modèle dans le registry local (models/objective3/latest).
+
+    Ne s'exécute que si appelé explicitement (ex: via env MLOPS_EXPORT=1).
+    """
+
+    model, info = train_and_cache(force=force_retrain)
+    from mlops.registry import register_model
+
+    meta = asdict(info)
+    entry = register_model("objective3", model, meta)
+    return {
+        "status": "success",
+        "objective": "objective3",
+        "version": entry.version,
+        "model_path": str(entry.model_path),
+        "metadata_path": str(entry.metadata_path),
+    }
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    print(run_Classification())
+
+    if os.getenv("MLOPS_EXPORT", "0").strip().lower() in ("1", "true", "yes"):
+        try:
+            print(mlops_export_latest(force_retrain=False))
+        except Exception as e:
+            print({"status": "error", "message": f"MLOps export failed: {e}"})

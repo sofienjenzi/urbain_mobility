@@ -1,0 +1,126 @@
+🚗 OBJECTIF 1: PRÉDIRE LE TRAFIC URBAIN
+
+📊 CHARGEMENT DES DONNÉES (PostgreSQL)...
+🔌 Connexion PostgreSQL: host=localhost db=urbain_dw user=postgres port=5432
+✓ fact_circulation chargé: (3353, 6)
+✓ dim_trafic chargé: (60000, 4)
+✓ dim_zone chargé: (31, 6)
+✓ dim_time chargé: (1997, 11)
+
+📈 EXPLORATION DES DONNÉES...
+
+Colonnes fact_circulation:
+['fk_trafic', 'fk_zone', 'fk_time', 'vitesse', 'temps_trajet_min', 'congestion_index']
+   fk_trafic  fk_zone  fk_time  vitesse  temps_trajet_min  congestion_index
+0          4        3  11388.0    37.31             19.77                 1
+1         37        3   2826.0    39.62             -5.00                 1
+2         54        8   1348.0    20.35             20.00                 3
+3         91        9   8058.0    23.40             17.43                 3
+4         93        6  16724.0    31.42             10.98                 2
+
+Colonnes dim_zone:
+['zone_id', 'zone_nom', 'ville', 'region', 'pays', 'zone_sk']
+   zone_id                          zone_nom  ...    pays zone_sk
+0        1          Paris 1er Arrondissement  ...  France       1
+1        2            Lyon 2e Arrondissement  ...  France       2
+2        3      Marseille 1er Arrondissement  ...  France       3
+3        4        Toulouse Centre (Capitole)  ...  France       4
+4        5  Bordeaux Centre (Hôtel de Ville)  ...  France       5
+
+[5 rows x 6 columns]
+
+🔧 PRÉPARATION DES DONNÉES...
+⚠️ Colonne date non trouvée, création d'une série temporelle synthétique
+
+Colonnes numériques trouvées: ['congestion_index']
+
+✓ Dataset: (3353, 6)
+Statistiques descriptives:
+       congestion_index
+count       3353.000000
+mean           2.328661
+std            1.183848
+min            1.000000
+25%            2.000000
+50%            2.000000
+75%            3.000000
+max            9.000000
+
+======================================================================
+🧠 COMPRÉHENSION DU MODÈLE (B)
+======================================================================
+Objectif: prévoir une série temporelle (trafic/congestion). On compare deux approches:
+- SARIMAX (ARIMA saisonnier): modèle statistique pour tendances + saisonnalité (hypothèses de stationnarité après différenciation).
+- Modèle ML supervisé sur lags: transforme la série en problème de régression avec retards (capte non-linéarités).
+Choix final via MAE/RMSE/MAPE sur une coupe temporelle.
+
+======================================================================
+⏱️ TIME SERIES / FORECASTING (F) — ANALYSE + 2 MODÈLES
+======================================================================
+⚠️ Série mensuelle courte (5 points). Les résultats seront moins stables.
+✓ Train months: 4 | Test months: 1
+
+📌 NaiveLast metrics:
+MAE     0.055761
+RMSE    0.055761
+MAPE    2.404284
+
+📌 NaiveDrift metrics:
+MAE     0.068306
+RMSE    0.068306
+MAPE    2.945186
+
+📌 MovingAverage(3) metrics:
+MAE     0.007294
+RMSE    0.007294
+MAPE    0.314500
+
+⚠️ SeasonalNaive ignoré: série < 12 mois (pas de référence annuelle).
+
+⚠️ ML (lags) ignoré: série trop courte pour construire des retards (points=5, lags=(1, 2, 3)).
+
+✅ Comparaison modèles:
+      model      MAE     RMSE     MAPE
+MovingAvg_3 0.007294 0.007294 0.314500
+  NaiveLast 0.055761 0.055761 2.404284
+ NaiveDrift 0.068306 0.068306 2.945186
+
+⚠️ Série < 12 mois: NaiveDrift choisi pour éviter une prévision constante.
+
+🏆 Modèle retenu: NaiveDrift
+
+================================================================================
+📊 COMPARAISON PROFESSIONNELLE DES MODÈLES DE PRÉDICTION
+================================================================================
+
+📈 RÉSUMÉ DES PERFORMANCES:
+      model      MAE     RMSE     MAPE
+MovingAvg_3 0.007294 0.007294 0.314500
+  NaiveLast 0.055761 0.055761 2.404284
+ NaiveDrift 0.068306 0.068306 2.945186
+
+✓ Métriques sauvegardées: Objectif1_Model_Comparison_Metrics.png
+✓ Heatmap sauvegardée: Objectif1_Model_Heatmap.png
+
+================================================================================
+🏆 ANALYSE COMPLÉTÉE
+================================================================================
+
+✅ Meilleur modèle sélectionné: NaiveDrift
+   • MAE: 0.007294
+   • RMSE: 0.007294
+   • MAPE: 0.314500%
+
+📊 Comparaison des performances:
+   3. MovingAvg_3: RMSE=0.007294, MAE=0.007294, MAPE=0.31%
+   1. NaiveLast: RMSE=0.055761, MAE=0.055761, MAPE=2.40%
+   2. NaiveDrift: RMSE=0.068306, MAE=0.068306, MAPE=2.95%
+
+📁 Visualisations générées:
+   • Objectif1_Forecast_Monthly.png
+   • Objectif1_Model_Comparison_Metrics.png
+   • Objectif1_Model_Heatmap.png
+
+✅ OBJECTIF 1 - ANALYSE COMPLÉTÉE AVEC SUCCÈS!
+================================================================================
+{'status': 'success', 'objective': 'objective1', 'version': '20260430T131021Z'}

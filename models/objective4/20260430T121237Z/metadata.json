@@ -1,0 +1,21 @@
+{
+  "feature_cols": [
+    "activity_value",
+    "emission_factor",
+    "dechets_kg",
+    "station_kwh",
+    "year",
+    "month",
+    "mode",
+    "activity_type"
+  ],
+  "targets": [
+    "co2_kg",
+    "energie_kwh"
+  ],
+  "fast_mode": true,
+  "only_db": true,
+  "objective": "objective4",
+  "version": "20260430T121237Z",
+  "created_at": "2026-04-30T12:12:37.094343+00:00"
+}

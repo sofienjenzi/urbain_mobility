@@ -1,0 +1,1 @@
+{'status': 'success', 'objective': 'objective3', 'version': '20260429T145335Z', 'model_path': 'C:\\Users\\user\\Downloads\\colab_notebooks\\models\\objective3\\20260429T145335Z\\model.joblib', 'metadata_path': 'C:\\Users\\user\\Downloads\\colab_notebooks\\models\\objective3\\20260429T145335Z\\metadata.json'}

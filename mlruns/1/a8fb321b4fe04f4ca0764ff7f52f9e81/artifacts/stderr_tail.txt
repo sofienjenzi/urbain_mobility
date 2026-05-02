@@ -1,0 +1,14 @@
+C:\Users\user\Downloads\colab_notebooks\.venv\Lib\site-packages\joblib\externals\loky\backend\resource_tracker.py:359: UserWarning: resource_tracker: There appear to be 6 leaked folder objects to clean up at shutdown
+  warnings.warn(
+C:\Users\user\Downloads\colab_notebooks\.venv\Lib\site-packages\joblib\externals\loky\backend\resource_tracker.py:375: UserWarning: resource_tracker: C:\Users\user\AppData\Local\Temp\joblib_memmapping_folder_18280_a3d9575a117540b4a5536c14ce4bf45a_09303f8312ed473084642577c6d5315d: FileNotFoundError(2, 'Le fichier spÃ©cifiÃ© est introuvable')
+  warnings.warn(f"resource_tracker: {name}: {e!r}")
+C:\Users\user\Downloads\colab_notebooks\.venv\Lib\site-packages\joblib\externals\loky\backend\resource_tracker.py:375: UserWarning: resource_tracker: C:\Users\user\AppData\Local\Temp\joblib_memmapping_folder_18280_a3d9575a117540b4a5536c14ce4bf45a_e6f1128b68c54f36a64c08a5e0c7c912: FileNotFoundError(2, 'Le fichier spÃ©cifiÃ© est introuvable')
+  warnings.warn(f"resource_tracker: {name}: {e!r}")
+C:\Users\user\Downloads\colab_notebooks\.venv\Lib\site-packages\joblib\externals\loky\backend\resource_tracker.py:375: UserWarning: resource_tracker: C:\Users\user\AppData\Local\Temp\joblib_memmapping_folder_18280_3c841c2e4e4e45979aa2c02c1df510aa_dc9ca0c2c6b6494fa27fe60ab496a828: FileNotFoundError(2, 'Le fichier spÃ©cifiÃ© est introuvable')
+  warnings.warn(f"resource_tracker: {name}: {e!r}")
+C:\Users\user\Downloads\colab_notebooks\.venv\Lib\site-packages\joblib\externals\loky\backend\resource_tracker.py:375: UserWarning: resource_tracker: C:\Users\user\AppData\Local\Temp\joblib_memmapping_folder_18280_a3d9575a117540b4a5536c14ce4bf45a_0f0e262151a741b5a902b51078d8dbde: FileNotFoundError(2, 'Le fichier spÃ©cifiÃ© est introuvable')
+  warnings.warn(f"resource_tracker: {name}: {e!r}")
+C:\Users\user\Downloads\colab_notebooks\.venv\Lib\site-packages\joblib\externals\loky\backend\resource_tracker.py:375: UserWarning: resource_tracker: C:\Users\user\AppData\Local\Temp\joblib_memmapping_folder_18280_72b1299d5b304dccbd47d3a1699f8706_a0e05036ba044f5aab5d9c294be4ed6a: FileNotFoundError(2, 'Le fichier spÃ©cifiÃ© est introuvable')
+  warnings.warn(f"resource_tracker: {name}: {e!r}")
+C:\Users\user\Downloads\colab_notebooks\.venv\Lib\site-packages\joblib\externals\loky\backend\resource_tracker.py:375: UserWarning: resource_tracker: C:\Users\user\AppData\Local\Temp\joblib_memmapping_folder_18280_a3d9575a117540b4a5536c14ce4bf45a_1261054d28174319b5cca9c8ecdec480: FileNotFoundError(2, 'Le fichier spÃ©cifiÃ© est introuvable')
+  warnings.warn(f"resource_tracker: {name}: {e!r}")

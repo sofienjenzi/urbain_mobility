@@ -1,0 +1,12 @@
+{
+  "numeric_cols": [
+    "vitesse",
+    "temps_trajet_min",
+    "congestion_index"
+  ],
+  "r2": 0.9989006109519731,
+  "mae": 0.008378881307035365,
+  "objective": "objective2",
+  "version": "20260429T150303Z",
+  "created_at": "2026-04-29T15:03:03.318590+00:00"
+}

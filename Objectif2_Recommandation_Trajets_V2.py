@@ -12,9 +12,11 @@
 # ============ DÉPENDANCES / COMPAT COLAB vs PYTHON ============
 from __future__ import annotations
 
+import os
 import warnings
 from datetime import timedelta
 from pathlib import Path
+from difflib import get_close_matches
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -38,32 +40,135 @@ from sklearn.svm import SVR
 warnings.filterwarnings("ignore")
 
 
-def _is_colab() -> bool:
+# ============================
+# CONFIG BASE DE DONNÉES (PostgreSQL) — SOURCE DU MODÈLE
+# ============================
+DB_ENV_VARS = [
+    "DB_HOST",
+    "DB_PORT",
+    "DB_NAME",
+    "DB_USER",
+    "DB_PASSWORD",
+]
+
+# Valeurs par défaut demandées (surcharge possible via variables d'environnement DB_*)
+os.environ.setdefault("DB_HOST", "localhost")
+os.environ.setdefault("DB_PORT", "5432")
+os.environ.setdefault("DB_NAME", "urbain_dw")
+os.environ.setdefault("DB_USER", "postgres")
+os.environ.setdefault("DB_PASSWORD", "admin")
+os.environ.setdefault("DB_SCHEMA", "public")
+
+# Accélération (par défaut activée). Mettre FAST_MODE=0 pour le mode complet.
+FAST_MODE = os.getenv("FAST_MODE", "1").strip().lower() not in ("0", "false", "no")
+
+_ENGINE = None
+
+
+def _qident(name: str) -> str:
+    """Quote an SQL identifier safely (schema/table/column)."""
+    return '"' + str(name).replace('"', '""') + '"'
+
+
+def _db_enabled() -> bool:
+    return all(os.getenv(v) for v in DB_ENV_VARS)
+
+
+def _get_engine():
+    """Crée un engine SQLAlchemy pour PostgreSQL."""
     try:
-        import google.colab  # type: ignore
+        from sqlalchemy import create_engine  # type: ignore
+        from sqlalchemy.engine import URL  # type: ignore
+    except Exception as e:  # pragma: no cover
+        raise ImportError(
+            "SQLAlchemy n'est pas installé. Installe: pip install sqlalchemy psycopg2-binary"
+        ) from e
 
-        return True
-    except Exception:
-        return False
+    host = os.getenv("DB_HOST")
+    port = os.getenv("DB_PORT", "5432")
+    name = os.getenv("DB_NAME")
+    user = os.getenv("DB_USER")
+    password = os.getenv("DB_PASSWORD")
 
-
-def _data_dir() -> Path:
-    try:
-        return Path(__file__).resolve().parent
-    except Exception:
-        return Path.cwd()
-
-
-def _read_csv(filename: str) -> pd.DataFrame:
-    p = _data_dir() / filename
-    if p.exists():
-        return pd.read_csv(p)
-    p2 = Path.cwd() / filename
-    if p2.exists():
-        return pd.read_csv(p2)
-    raise FileNotFoundError(
-        f"Fichier introuvable: {filename}. Place-le dans {_data_dir()} ou dans le répertoire courant."
+    url = URL.create(
+        drivername="postgresql+psycopg2",
+        username=user,
+        password=password,
+        host=host,
+        port=int(port) if str(port).isdigit() else port,
+        database=name,
     )
+    return create_engine(url, pool_pre_ping=True)
+
+
+def _read_sql(sql: str) -> pd.DataFrame:
+    global _ENGINE
+    if _ENGINE is None:
+        _ENGINE = _get_engine()
+    try:
+        conn = _ENGINE.raw_connection()
+        try:
+            return pd.read_sql_query(sql, conn)
+        finally:
+            conn.close()
+    except Exception:
+        return pd.read_sql_query(sql, _ENGINE)
+
+
+def _db_limit_rows() -> int | None:
+    v = os.getenv("DB_LIMIT_ROWS", "").strip()
+    if not v:
+        return None
+    try:
+        n = int(v)
+        return n if n > 0 else None
+    except Exception:
+        return None
+
+
+def _list_tables(schema: str = "public") -> list[str]:
+    sql = (
+        "SELECT table_name FROM information_schema.tables "
+        f"WHERE table_schema='{schema}' AND table_type='BASE TABLE' ORDER BY table_name;"
+    )
+    d = _read_sql(sql)
+    if 'table_name' not in d.columns:
+        return []
+    return [str(x) for x in d['table_name'].dropna().tolist()]
+
+
+def _resolve_table(
+    preferred: str,
+    schema: str = "public",
+    like_patterns: list[str] | None = None,
+) -> str | None:
+    """Résout un nom de table réel dans la DB."""
+    tables = _list_tables(schema=schema)
+    if preferred in tables:
+        return preferred
+
+    if like_patterns:
+        for pat in like_patterns:
+            pat_sql = pat.replace("'", "''")
+            sql = (
+                "SELECT table_name FROM information_schema.tables "
+                f"WHERE table_schema='{schema}' AND table_name ILIKE '{pat_sql}' "
+                "ORDER BY table_name;"
+            )
+            m = _read_sql(sql)
+            if 'table_name' in m.columns and len(m) > 0:
+                return str(m['table_name'].iloc[0])
+
+    close = get_close_matches(preferred, tables, n=1, cutoff=0.65)
+    return close[0] if close else None
+
+
+def _read_table(table: str, schema: str = "public", limit: int | None = None) -> pd.DataFrame:
+    lim = limit if limit is not None else _db_limit_rows()
+    if lim is not None:
+        return _read_sql(f"SELECT * FROM {_qident(schema)}.{_qident(table)} LIMIT {int(lim)};")
+    return _read_sql(f"SELECT * FROM {_qident(schema)}.{_qident(table)};")
+
 
 # Configuration style professionnel
 sns.set_style("whitegrid")
@@ -75,65 +180,67 @@ print("\n" + "="*80)
 print("🗺️ OBJECTIF 2: MEILLEURS TRAJETS - ANALYSE PROFESSIONNELLE")
 print("="*80 + "\n")
 
-print("📊 CHARGEMENT DES DONNÉES...")
+print("📊 CHARGEMENT DES DONNÉES (PostgreSQL)...")
 
-if _is_colab():
-    try:
-        from google.colab import files  # type: ignore
+if not _db_enabled():
+    raise RuntimeError(
+        "Connexion PostgreSQL non configurée. Variables requises: DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD. "
+        "(Par défaut: localhost/5432/urbain_dw/postgres/admin)"
+    )
 
-        _ = files.upload()
-    except Exception:
-        pass
+schema = os.getenv("DB_SCHEMA", "public")
 
-# Charger les données
-try:
-    fact_circulation = _read_csv('fact_circulation.csv')
-    print(f"✓ fact_circulation chargé: {fact_circulation.shape}")
-except Exception as e:
-    print(f"⚠️ Error loading fact_circulation: {e}")
-    fact_circulation = None
+fact_table = _resolve_table(
+    preferred=os.getenv("FACT_CIRCULATION_TABLE", "fact_circulation"),
+    schema=schema,
+    like_patterns=["fact_circu%", "fact_circulation%"],
+)
+if fact_table is None:
+    raise RuntimeError(f"Table fact_circulation introuvable dans le schéma {schema}.")
 
-try:
-    dim_zone = _read_csv('dim_zone.csv')
+# Dimensions (optionnelles)
+dim_zone_table = _resolve_table(os.getenv("DIM_ZONE_TABLE", "dim_zone"), schema=schema, like_patterns=["dim_zone%"])
+dim_ligne_table = _resolve_table(os.getenv("DIM_LIGNE_TABLE", "dim_ligne"), schema=schema, like_patterns=["dim_ligne%", "dim_line%"])
+dim_segment_table = _resolve_table(os.getenv("DIM_SEGMENT_TABLE", "dim_segment"), schema=schema, like_patterns=["dim_segment%"])
+dim_arret_table = _resolve_table(os.getenv("DIM_ARRET_TABLE", "dim_arret"), schema=schema, like_patterns=["dim_arret%", "dim_stop%", "dim_station%"])
+dim_trafic_table = _resolve_table(os.getenv("DIM_TRAFIC_TABLE", "dim_trafic"), schema=schema, like_patterns=["dim_trafic%"])
+dim_time_table = _resolve_table(os.getenv("DIM_TIME_TABLE", "dim_time"), schema=schema, like_patterns=["dim_time%", "dim_temps%"])
+
+print("\n📌 Tables DB utilisées:")
+print(f"  - fact: {schema}.{fact_table}")
+print(f"  - dim_zone: {schema}.{dim_zone_table}" if dim_zone_table else "  - dim_zone: (non trouvée)")
+print(f"  - dim_ligne: {schema}.{dim_ligne_table}" if dim_ligne_table else "  - dim_ligne: (non trouvée)")
+print(f"  - dim_segment: {schema}.{dim_segment_table}" if dim_segment_table else "  - dim_segment: (non trouvée)")
+print(f"  - dim_arret: {schema}.{dim_arret_table}" if dim_arret_table else "  - dim_arret: (non trouvée)")
+print(f"  - dim_trafic: {schema}.{dim_trafic_table}" if dim_trafic_table else "  - dim_trafic: (non trouvée)")
+print(f"  - dim_time: {schema}.{dim_time_table}" if dim_time_table else "  - dim_time: (non trouvée)")
+
+fact_circulation = _read_table(fact_table, schema=schema)
+print(f"✓ fact_circulation chargé: {fact_circulation.shape}")
+
+dim_zone = _read_table(dim_zone_table, schema=schema) if dim_zone_table else None
+if dim_zone is not None:
     print(f"✓ dim_zone chargé: {dim_zone.shape}")
-except Exception as e:
-    print(f"⚠️ dim_zone non trouvé: {e}")
-    dim_zone = None
 
-try:
-    dim_ligne = _read_csv('dim_ligne.csv')
+dim_ligne = _read_table(dim_ligne_table, schema=schema) if dim_ligne_table else None
+if dim_ligne is not None:
     print(f"✓ dim_ligne chargé: {dim_ligne.shape}")
-except Exception as e:
-    print(f"⚠️ dim_ligne non trouvé: {e}")
-    dim_ligne = None
 
-try:
-    dim_segment = _read_csv('dim_segment.csv')
+dim_segment = _read_table(dim_segment_table, schema=schema) if dim_segment_table else None
+if dim_segment is not None:
     print(f"✓ dim_segment chargé: {dim_segment.shape}")
-except Exception as e:
-    print(f"⚠️ dim_segment non trouvé: {e}")
-    dim_segment = None
 
-try:
-    dim_arret = _read_csv('dim_arret.csv')
+dim_arret = _read_table(dim_arret_table, schema=schema) if dim_arret_table else None
+if dim_arret is not None:
     print(f"✓ dim_arret chargé: {dim_arret.shape}")
-except Exception as e:
-    print(f"⚠️ dim_arret non trouvé: {e}")
-    dim_arret = None
 
-try:
-    dim_trafic = _read_csv('dim_trafic.csv')
+dim_trafic = _read_table(dim_trafic_table, schema=schema) if dim_trafic_table else None
+if dim_trafic is not None:
     print(f"✓ dim_trafic chargé: {dim_trafic.shape}")
-except Exception as e:
-    print(f"⚠️ dim_trafic non trouvé: {e}")
-    dim_trafic = None
 
-try:
-    dim_time = _read_csv('dim_time.csv')
+dim_time = _read_table(dim_time_table, schema=schema) if dim_time_table else None
+if dim_time is not None:
     print(f"✓ dim_time chargé: {dim_time.shape}")
-except Exception as e:
-    print(f"⚠️ dim_time non trouvé: {e}")
-    dim_time = None
 
 # ============ EXPLORATION DES DONNÉES ============
 print("\n📈 EXPLORATION DES DONNÉES...\n")
@@ -158,6 +265,49 @@ if dim_arret is not None:
 print("\n🔧 PRÉPARATION DES DONNÉES...\n")
 
 df = fact_circulation.copy() if fact_circulation is not None else pd.DataFrame()
+
+# Jointure temps -> date si la fact n'a pas de colonne date
+if 'date' not in df.columns and dim_time is not None and len(dim_time) > 0:
+    try:
+        # Clé fact (ex: fk_time) + clé dimension (ex: time_id)
+        time_fk = next(
+            (c for c in df.columns if 'time' in c.lower() and ('fk' in c.lower() or c.lower().endswith('_id'))),
+            None,
+        )
+        time_pk = next((c for c in dim_time.columns if 'time' in c.lower() and 'id' in c.lower()), None)
+
+        if time_fk and time_pk:
+            dtmp_cols = [time_pk]
+            for c in ['annee', 'mois', 'jour', 'heure', 'date']:
+                if c in dim_time.columns:
+                    dtmp_cols.append(c)
+
+            dtmp = dim_time[dtmp_cols].drop_duplicates(time_pk).copy()
+
+            # Cast join keys to avoid merge mismatch (float vs int)
+            df[time_fk] = pd.to_numeric(df[time_fk], errors='coerce').astype('Int64')
+            dtmp[time_pk] = pd.to_numeric(dtmp[time_pk], errors='coerce').astype('Int64')
+
+            # Construire une date fiable: préférer annee/mois/jour (+ heure) si disponibles
+            if all(c in dtmp.columns for c in ['annee', 'mois', 'jour']):
+                y = pd.to_numeric(dtmp['annee'], errors='coerce')
+                m = pd.to_numeric(dtmp['mois'], errors='coerce')
+                d = pd.to_numeric(dtmp['jour'], errors='coerce')
+                dtmp['date'] = pd.to_datetime({'year': y, 'month': m, 'day': d}, errors='coerce')
+
+                if 'heure' in dtmp.columns:
+                    htd = pd.to_timedelta(dtmp['heure'].astype(str), errors='coerce')
+                    dtmp['date'] = dtmp['date'] + htd.fillna(pd.Timedelta(0))
+            else:
+                date_col = next((c for c in dtmp.columns if 'date' in c.lower()), None)
+                if date_col and date_col != 'date':
+                    dtmp = dtmp.rename(columns={date_col: 'date'})
+                dtmp['date'] = pd.to_datetime(dtmp.get('date'), errors='coerce')
+
+            df = df.merge(dtmp[[time_pk, 'date']], left_on=time_fk, right_on=time_pk, how='left')
+            print(f"✓ Jointure dim_time appliquée: {time_fk} -> {time_pk} (date)")
+    except Exception:
+        pass
 
 # Afficher les colonnes disponibles pour debug
 print("📋 Colonnes dans fact_circulation:", df.columns.tolist() if len(df) > 0 else "Vide")
@@ -260,8 +410,11 @@ if 'date' not in df.columns:
     df['date'] = pd.date_range('2023-01-01', periods=len(df), freq='H')
 else:
     try:
-        df['date'] = pd.to_datetime(df['date'])
+        df['date'] = pd.to_datetime(df['date'], errors='coerce')
     except:
+        df['date'] = pd.date_range('2023-01-01', periods=len(df), freq='H')
+
+    if df['date'].isna().all():
         df['date'] = pd.date_range('2023-01-01', periods=len(df), freq='H')
 
 df['year'] = df['date'].dt.year
@@ -275,7 +428,12 @@ if 'line_nom' not in df.columns:
 if 'mode' not in df.columns:
     df['mode'] = 'Transport'
 if segment_key is None or segment_key not in df.columns:
-    df['segment_id'] = range(1, len(df) + 1)
+    if 'fk_trafic' in df.columns:
+        df['segment_id'] = pd.to_numeric(df['fk_trafic'], errors='coerce')
+        df['segment_id'] = df['segment_id'].fillna(pd.Series(np.arange(1, len(df) + 1), index=df.index))
+        df['segment_id'] = df['segment_id'].astype(int)
+    else:
+        df['segment_id'] = range(1, len(df) + 1)
 else:
     df['segment_id'] = df[segment_key]
 if 'stop_from_nom' not in df.columns:
@@ -475,7 +633,7 @@ if len(seg_df) >= 10 and seg_df.shape[1] >= 2:
     X_seg_scaled = scaler_seg.fit_transform(X_seg)
 
     # --- KMeans: Elbow + Silhouette
-    k_range = list(range(2, min(10, len(seg_df)) + 1))
+    k_range = list(range(2, min((6 if FAST_MODE else 10), len(seg_df)) + 1))
     inertias = []
     silhouettes = []
     for k in k_range:
@@ -614,7 +772,7 @@ param_dist = {
 search = RandomizedSearchCV(
     gb_model,
     param_distributions=param_dist,
-    n_iter=12,
+    n_iter=(6 if FAST_MODE else 12),
     scoring='r2',
     random_state=42,
     n_jobs=-1,
@@ -623,6 +781,9 @@ search = RandomizedSearchCV(
 search.fit(X_train, y_train)
 gb_model = search.best_estimator_
 print(f"✓ Modèle entraîné (tuning) sur {len(X_train)} échantillons")
+
+# Conserver le scaler associé au modèle principal (car plus bas, d'autres sections refittent `scaler`).
+scaler_gb = scaler
 
 y_pred = gb_model.predict(X_test)
 r2 = r2_score(y_test, y_pred)
@@ -649,7 +810,13 @@ print("="*80 + "\n")
 
 from datetime import timedelta
 
-max_date = df_model['date'].max() if 'date' in df_model.columns else pd.Timestamp('2026-01-01')
+if 'date' in df_model.columns:
+    max_date = pd.to_datetime(df_model['date'], errors='coerce').max()
+else:
+    max_date = pd.NaT
+if pd.isna(max_date):
+    max_date = pd.Timestamp('2026-01-01')
+
 segments_uniques = sorted(df_model['segment_id'].dropna().unique())
 
 print(f"✓ Segments uniques: {len(segments_uniques)}")
@@ -658,107 +825,82 @@ print(f"✓ Date maximale: {max_date}")
 # Générer 36 mois futurs
 future_dates = pd.date_range(start=max_date + timedelta(days=1), periods=36, freq='MS')
 
-predictions_list = []
+# Pré-calculer un profil par segment (moyennes des features + métadonnées)
+meta_cols = ['stop_from_nom', 'stop_to_nom', 'ville_depart', 'ville_arrivee', 'line_nom', 'mode']
+meta_cols = [c for c in meta_cols if c in df_model.columns]
 
+seg_num = df_model.groupby('segment_id', as_index=False)[numeric_cols].mean()
+seg_meta = df_model.groupby('segment_id', as_index=False)[meta_cols].first() if meta_cols else None
+
+segment_profile = seg_num.merge(seg_meta, on='segment_id', how='left') if seg_meta is not None else seg_num
+
+# Valeurs par défaut si manquantes
+defaults = {
+    'stop_from_nom': 'Arrêt Départ',
+    'stop_to_nom': 'Arrêt Arrivée',
+    'ville_depart': 'Ville Départ',
+    'ville_arrivee': 'Ville Arrivée',
+    'line_nom': 'Ligne Inconnue',
+    'mode': 'Transport',
+}
+for c, v in defaults.items():
+    if c not in segment_profile.columns:
+        segment_profile[c] = v
+    else:
+        segment_profile[c] = segment_profile[c].fillna(v).replace(['', None, 'NaN', 'nan'], v)
+
+segment_profile['trajet'] = (
+    segment_profile['stop_from_nom'].astype(str)
+    + " (" + segment_profile['ville_depart'].astype(str) + ") → "
+    + segment_profile['stop_to_nom'].astype(str)
+    + " (" + segment_profile['ville_arrivee'].astype(str) + ")"
+)
+
+predictions_frames = []
+
+# Générer 36 mois futurs (vectorisé par mois pour éviter une double boucle lente)
 for date in future_dates:
     year = date.year
     month = date.month
-    
-    for segment in segments_uniques:
-        segment_mask = df_model['segment_id'] == segment
-        segment_data = df_model[segment_mask]
-        
-        if len(segment_data) > 0:
-            # Récupérer les informations du segment avec robustesse
-            stop_from_nom = 'Arrêt Départ'
-            stop_to_nom = 'Arrêt Arrivée'
-            ville_depart = 'Ville Départ'
-            ville_arrivee = 'Ville Arrivée'
-            line_nom = 'Ligne Inconnue'
-            mode = 'Transport'
-            
-            # Chercher les bonnes colonnes et récupérer les valeurs réelles
-            if 'stop_from_nom' in segment_data.columns:
-                val = segment_data['stop_from_nom'].iloc[0]
-                if pd.notna(val) and str(val).strip() and 'Arrêt' not in str(val):
-                    stop_from_nom = str(val)
-            
-            if 'stop_to_nom' in segment_data.columns:
-                val = segment_data['stop_to_nom'].iloc[0]
-                if pd.notna(val) and str(val).strip() and 'Arrêt' not in str(val):
-                    stop_to_nom = str(val)
-            
-            if 'ville_depart' in segment_data.columns:
-                val = segment_data['ville_depart'].iloc[0]
-                if pd.notna(val) and str(val).strip() and 'Ville' not in str(val):
-                    ville_depart = str(val)
-            
-            if 'ville_arrivee' in segment_data.columns:
-                val = segment_data['ville_arrivee'].iloc[0]
-                if pd.notna(val) and str(val).strip() and 'Ville' not in str(val):
-                    ville_arrivee = str(val)
-            
-            if 'line_nom' in segment_data.columns:
-                val = segment_data['line_nom'].iloc[0]
-                if pd.notna(val) and str(val).strip() and 'Ligne' not in str(val):
-                    line_nom = str(val)
-            
-            if 'mode' in segment_data.columns:
-                val = segment_data['mode'].iloc[0]
-                if pd.notna(val) and str(val).strip() and val != 'Transport':
-                    mode = str(val)
-            
-            # Créer le trajet complet professionnel
-            trajet_detail = f"{stop_from_nom} ({ville_depart}) → {stop_to_nom} ({ville_arrivee})"
-            
-            # Calculer les moyennes par segment
-            avg_values = segment_data[numeric_cols].mean()
-            
-            # Appliquer saisonnalité et bruit
-            seasonal_factor = 1.0 + 0.25 * np.sin(2 * np.pi * month / 12)
-            noise = np.random.uniform(0.85, 1.15)
-            
-            # Créer les features pour la prédiction
-            feature_values = []
-            for col in numeric_cols:
-                val = avg_values.get(col, 0) * seasonal_factor * noise
-                feature_values.append(max(0.1, val))
-            
-            feature_row = pd.DataFrame([feature_values], columns=numeric_cols)
-            feature_scaled = scaler.transform(feature_row)
-            
-            # Prédire quality_score
-            quality_pred = gb_model.predict(feature_scaled)[0]
-            
-            # Déterminer la recommandation professionnelle
-            if quality_pred > 0.6:
-                recommendation = "🌟 Excellent"
-            elif quality_pred > 0.3:
-                recommendation = "✅ Très Bon"
-            elif quality_pred > 0:
-                recommendation = "👍 Bon"
-            elif quality_pred > -0.3:
-                recommendation = "⚠️ Moyen"
-            else:
-                recommendation = "❌ À Éviter"
-            
-            predictions_list.append({
-                'segment_id': int(segment),
-                'trajet': trajet_detail,
-                'stop_depart': stop_from_nom,
-                'ville_depart': ville_depart,
-                'stop_arrivee': stop_to_nom,
-                'ville_arrivee': ville_arrivee,
-                'ligne': line_nom,
-                'mode': mode,
-                'année': year,
-                'mois': month,
-                'date': date,
-                'quality_score': float(quality_pred),
-                'recommendation': recommendation
-            })
 
-predictions_df = pd.DataFrame(predictions_list)
+    seasonal_factor = 1.0 + 0.25 * np.sin(2 * np.pi * month / 12)
+    noise = np.random.uniform(0.85, 1.15, size=len(segment_profile))
+
+    X_month = segment_profile[numeric_cols].to_numpy(dtype=float)
+    X_month = np.maximum(0.1, X_month * (seasonal_factor * noise)[:, None])
+
+    X_scaled_month = scaler.transform(X_month)
+    quality_preds = gb_model.predict(X_scaled_month)
+
+    rec = np.where(
+        quality_preds > 0.6,
+        "🌟 Excellent",
+        np.where(
+            quality_preds > 0.3,
+            "✅ Très Bon",
+            np.where(quality_preds > 0, "👍 Bon", np.where(quality_preds > -0.3, "⚠️ Moyen", "❌ À Éviter")),
+        ),
+    )
+
+    df_month = pd.DataFrame({
+        'segment_id': segment_profile['segment_id'].astype(int),
+        'trajet': segment_profile['trajet'].astype(str),
+        'stop_depart': segment_profile['stop_from_nom'].astype(str),
+        'ville_depart': segment_profile['ville_depart'].astype(str),
+        'stop_arrivee': segment_profile['stop_to_nom'].astype(str),
+        'ville_arrivee': segment_profile['ville_arrivee'].astype(str),
+        'ligne': segment_profile['line_nom'].astype(str),
+        'mode': segment_profile['mode'].astype(str),
+        'année': year,
+        'mois': month,
+        'date': date,
+        'quality_score': quality_preds.astype(float),
+        'recommendation': rec.astype(str),
+    })
+
+    predictions_frames.append(df_month)
+
+predictions_df = pd.concat(predictions_frames, ignore_index=True)
 
 # Enrichir avec clusters (E)
 try:
@@ -1088,7 +1230,7 @@ try:
                 )
 
         # Agglomerative (même k que KMeans si dispo)
-        k_for_aggl = int(best_k) if 'best_k' in locals() else (int(best_k_kmeans) if 'best_k_kmeans' in locals() else 3)
+        k_for_aggl = int(best_k) if 'best_k' in locals() else 3
         k_for_aggl = max(2, min(k_for_aggl, len(seg_df) - 1))
         agg = AgglomerativeClustering(n_clusters=k_for_aggl)
         agg_labels = agg.fit_predict(X_seg_scaled)
@@ -1151,13 +1293,13 @@ try:
     rf_search = RandomizedSearchCV(
         rf,
         param_distributions={
-            'n_estimators': [200, 500, 800],
-            'max_depth': [None, 6, 10, 18],
-            'min_samples_split': [2, 5, 10],
-            'min_samples_leaf': [1, 2, 4],
+            'n_estimators': ([200, 400] if FAST_MODE else [200, 500, 800]),
+            'max_depth': ([None, 10] if FAST_MODE else [None, 6, 10, 18]),
+            'min_samples_split': ([2, 5] if FAST_MODE else [2, 5, 10]),
+            'min_samples_leaf': ([1, 2] if FAST_MODE else [1, 2, 4]),
         },
-        n_iter=12,
-        cv=5,
+        n_iter=(6 if FAST_MODE else 12),
+        cv=(3 if FAST_MODE else 5),
         scoring='r2',
         random_state=42,
         n_jobs=-1,
@@ -1169,8 +1311,12 @@ try:
     svr = SVR()
     svr_search = GridSearchCV(
         svr,
-        param_grid={'C': [0.5, 1.0, 3.0], 'epsilon': [0.05, 0.1, 0.2], 'gamma': ['scale', 'auto']},
-        cv=5,
+        param_grid=(
+            {'C': [1.0, 3.0], 'epsilon': [0.1], 'gamma': ['scale']}
+            if FAST_MODE
+            else {'C': [0.5, 1.0, 3.0], 'epsilon': [0.05, 0.1, 0.2], 'gamma': ['scale', 'auto']}
+        ),
+        cv=(3 if FAST_MODE else 5),
         scoring='r2',
         n_jobs=-1,
     )
@@ -1183,8 +1329,12 @@ try:
     knn = KNeighborsRegressor()
     knn_search = GridSearchCV(
         knn,
-        param_grid={'n_neighbors': [3, 5, 9, 15], 'weights': ['uniform', 'distance']},
-        cv=5,
+        param_grid=(
+            {'n_neighbors': [5, 9], 'weights': ['distance']}
+            if FAST_MODE
+            else {'n_neighbors': [3, 5, 9, 15], 'weights': ['uniform', 'distance']}
+        ),
+        cv=(3 if FAST_MODE else 5),
         scoring='r2',
         n_jobs=-1,
     )
@@ -1233,3 +1383,34 @@ except Exception as e:
 
 print("\n✅ OBJECTIF 2 TERMINÉ!")
 print("=" * 80)
+
+
+def _mlops_export_objective2() -> None:
+    if os.getenv("MLOPS_EXPORT", "0").strip().lower() not in ("1", "true", "yes"):
+        return
+
+    from mlops.registry import register_model
+
+    if "gb_model" not in globals() or "numeric_cols" not in globals():
+        print("⚠️ MLOps export ignoré: variables manquantes (gb_model/numeric_cols).")
+        return
+
+    bundle = {
+        "scaler": globals().get("scaler_gb") or globals().get("scaler"),
+        "regressor": globals().get("gb_model"),
+    }
+
+    meta = {
+        "numeric_cols": list(globals().get("numeric_cols") or []),
+        "r2": float(globals().get("r2", float("nan"))),
+        "mae": float(globals().get("mae", float("nan"))),
+    }
+
+    try:
+        entry = register_model("objective2", bundle, meta)
+        print({"status": "success", "objective": "objective2", "version": entry.version})
+    except Exception as e:
+        print({"status": "error", "message": f"MLOps export failed: {e}"})
+
+
+_mlops_export_objective2()

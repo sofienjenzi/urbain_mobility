@@ -7,9 +7,12 @@ des prédictions sur 36 mois et des visualisations professionnelles.
 # ============ DÉPENDANCES / COMPAT COLAB vs PYTHON ============
 from __future__ import annotations
 
+import os
+import sys
 import warnings
 from datetime import timedelta
 from pathlib import Path
+from difflib import get_close_matches
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -36,7 +39,380 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, RobustScaler
 from sklearn.svm import LinearSVR
 
+from mlops.transformers import QuantileClipper
+
 warnings.filterwarnings("ignore")
+
+# Windows terminals may default to cp1252 which can crash on non-ASCII output.
+# Force UTF-8 where supported.
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+if hasattr(sys.stderr, "reconfigure"):
+    try:
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
+
+# ============================
+# CONFIG BASE DE DONNÉES (PostgreSQL)
+# ============================
+# Mode par défaut: si les variables d'environnement DB_* sont définies, on lit depuis PostgreSQL.
+# Sinon, fallback: lecture CSV depuis le dossier courant (sans upload Colab).
+DB_ENV_VARS = [
+    "DB_HOST",
+    "DB_PORT",
+    "DB_NAME",
+    "DB_USER",
+    "DB_PASSWORD",
+]
+
+# Connexion PostgreSQL (valeurs par défaut demandées)
+# NB: vous pouvez toujours surcharger via variables d'environnement DB_*.
+os.environ.setdefault("DB_HOST", "localhost")
+os.environ.setdefault("DB_PORT", "5432")
+os.environ.setdefault("DB_NAME", "urbain_dw")
+os.environ.setdefault("DB_USER", "postgres")
+os.environ.setdefault("DB_PASSWORD", "admin")
+os.environ.setdefault("DB_SCHEMA", "public")
+
+# Accélération (par défaut)
+# - FAST_MODE=1 : tuning réduit (plus rapide)
+# - ONLY_DB=1 : pas de plots/rapport, on écrit en base puis on s'arrête
+FAST_MODE = os.getenv("FAST_MODE", "1").strip().lower() not in ("0", "false", "no")
+ONLY_DB = os.getenv("ONLY_DB", "1").strip().lower() not in ("0", "false", "no")
+
+_ENGINE = None
+
+
+def _qident(name: str) -> str:
+    """Quote an SQL identifier safely (schema/table/column)."""
+    return '"' + str(name).replace('"', '""') + '"'
+
+
+def _db_enabled() -> bool:
+    return all(os.getenv(v) for v in DB_ENV_VARS)
+
+
+def _get_engine():
+    """Crée un engine SQLAlchemy pour PostgreSQL.
+
+    Dépendances:
+      - sqlalchemy
+      - psycopg2-binary
+    """
+    try:
+        from sqlalchemy import create_engine  # type: ignore
+        from sqlalchemy.engine import URL  # type: ignore
+    except Exception as e:  # pragma: no cover
+        raise ImportError(
+            "SQLAlchemy n'est pas installé. Installe: pip install sqlalchemy psycopg2-binary"
+        ) from e
+
+    host = os.getenv("DB_HOST")
+    port = os.getenv("DB_PORT", "5432")
+    name = os.getenv("DB_NAME")
+    user = os.getenv("DB_USER")
+    password = os.getenv("DB_PASSWORD")
+
+    url = URL.create(
+        drivername="postgresql+psycopg2",
+        username=user,
+        password=password,
+        host=host,
+        port=int(port) if str(port).isdigit() else port,
+        database=name,
+    )
+    return create_engine(url, pool_pre_ping=True)
+
+
+def _read_sql(sql: str) -> pd.DataFrame:
+    global _ENGINE
+    if _ENGINE is None:
+        _ENGINE = _get_engine()
+    # NOTE: Certaines combinaisons pandas/SQLAlchemy 2.x peuvent provoquer
+    # des erreurs côté driver quand la requête contient des '%' (ILIKE patterns)
+    # à cause d'un "params" vide transmis au driver. On contourne en passant
+    # par une connexion DB-API (psycopg2) via raw_connection().
+    try:
+        conn = _ENGINE.raw_connection()
+        try:
+            return pd.read_sql_query(sql, conn)
+        finally:
+            conn.close()
+    except Exception:
+        return pd.read_sql_query(sql, _ENGINE)
+
+
+def _db_limit_rows() -> int | None:
+    v = os.getenv("DB_LIMIT_ROWS", "").strip()
+    if not v:
+        return None
+    try:
+        n = int(v)
+        return n if n > 0 else None
+    except Exception:
+        return None
+
+
+def _list_tables(schema: str = "public") -> list[str]:
+    sql = """
+    SELECT table_name
+    FROM information_schema.tables
+    WHERE table_schema = %(schema)s
+      AND table_type = 'BASE TABLE'
+    ORDER BY table_name;
+    """.strip()
+    df_t = _read_sql(sql.replace("%(schema)s", f"'{schema}'"))
+    if 'table_name' not in df_t.columns:
+        return []
+    return [str(x) for x in df_t['table_name'].dropna().tolist()]
+
+
+def _resolve_table(
+    preferred: str,
+    schema: str = "public",
+    like_patterns: list[str] | None = None,
+) -> str | None:
+    """Résout un nom de table réel dans la DB.
+
+    - Essaie d'abord `preferred`.
+    - Puis des patterns ILIKE.
+    - Puis un fuzzy match (proche) via difflib.
+    """
+    tables = _list_tables(schema=schema)
+    if preferred in tables:
+        return preferred
+
+    if like_patterns:
+        for pat in like_patterns:
+            pat_sql = pat.replace("'", "''")
+            sql = (
+                "SELECT table_name FROM information_schema.tables "
+                f"WHERE table_schema='{schema}' AND table_name ILIKE '{pat_sql}' "
+                "ORDER BY table_name;"
+            )
+            df_m = _read_sql(sql)
+            if 'table_name' in df_m.columns and len(df_m) > 0:
+                return str(df_m['table_name'].iloc[0])
+
+    # Fuzzy match
+    close = get_close_matches(preferred, tables, n=1, cutoff=0.65)
+    return close[0] if close else None
+
+
+def _read_table(table: str, schema: str = "public", limit: int | None = None) -> pd.DataFrame:
+    lim = limit if limit is not None else _db_limit_rows()
+    if lim is not None:
+        return _read_sql(f"SELECT * FROM {_qident(schema)}.{_qident(table)} LIMIT {int(lim)};")
+    return _read_sql(f"SELECT * FROM {_qident(schema)}.{_qident(table)};")
+
+
+def _table_columns(schema: str, table: str) -> set[str]:
+    sql = (
+        "SELECT column_name FROM information_schema.columns "
+        f"WHERE table_schema='{schema}' AND table_name='{table}' ORDER BY ordinal_position;"
+    )
+    d = _read_sql(sql)
+    if 'column_name' not in d.columns:
+        return set()
+    return set(str(x) for x in d['column_name'].dropna().tolist())
+
+
+def _try_read_joined_fact(
+    schema: str,
+    fact_table: str,
+    dim_emission_table: str | None,
+    dim_energie_table: str | None,
+    dim_zone_table: str | None,
+) -> tuple[pd.DataFrame | None, str | None]:
+    """Tente une requête SQL jointe (LEFT JOIN) pour obtenir un df déjà enrichi.
+
+    Retourne (df, sql) si OK, sinon (None, None).
+    """
+    f_cols = _table_columns(schema, fact_table)
+
+    select_parts = ["f.*"]
+    join_parts: list[str] = []
+
+    if dim_emission_table:
+        e_cols = _table_columns(schema, dim_emission_table)
+        if ('fk_emco2' in f_cols) and ('emission_id' in e_cols):
+            if 'mode' in e_cols:
+                select_parts.append('e.mode')
+            if 'activity_type' in e_cols:
+                select_parts.append('e.activity_type')
+            join_parts.append(
+                f"LEFT JOIN {_qident(schema)}.{_qident(dim_emission_table)} e ON f.fk_emco2 = e.emission_id"
+            )
+
+    if dim_energie_table:
+        t_cols = _table_columns(schema, dim_energie_table)
+        if ('fk_energie' in f_cols) and ('energie_id' in t_cols):
+            if 'type_energie' in t_cols:
+                select_parts.append('t.type_energie')
+            if 'source_energie' in t_cols:
+                select_parts.append('t.source_energie')
+            join_parts.append(
+                f"LEFT JOIN {_qident(schema)}.{_qident(dim_energie_table)} t ON f.fk_energie = t.energie_id"
+            )
+
+    if dim_zone_table:
+        z_cols = _table_columns(schema, dim_zone_table)
+        if ('fk_zone' in f_cols) and ('zone_id' in z_cols):
+            if 'zone_name' in z_cols:
+                select_parts.append('z.zone_name')
+            elif 'zone_nom' in z_cols:
+                select_parts.append('z.zone_nom AS zone_name')
+            join_parts.append(
+                f"LEFT JOIN {_qident(schema)}.{_qident(dim_zone_table)} z ON f.fk_zone = z.zone_id"
+            )
+
+    sql = (
+        "SELECT\n    "
+        + ",\n    ".join(select_parts)
+        + f"\nFROM {_qident(schema)}.{_qident(fact_table)} f\n"
+        + ("\n".join(join_parts) + "\n" if join_parts else "")
+    )
+
+    lim = _db_limit_rows()
+    if lim is not None:
+        sql += f"LIMIT {int(lim)}\n"
+
+    sql = (sql + ";").strip()
+
+    try:
+        return _read_sql(sql), sql
+    except Exception:
+        return None, None
+
+
+def _write_predictions_to_postgres(predictions_df: pd.DataFrame) -> None:
+    """Crée 2 tables dans PostgreSQL et upsert les prédictions 2027-2029."""
+    schema = os.getenv("DB_SCHEMA", "public")
+    co2_table = os.getenv("DB_PRED_CO2_TABLE", "predictions_co2_2027_2029")
+    energy_table = os.getenv("DB_PRED_ENERGIE_TABLE", "predictions_energie_2027_2029")
+
+    if predictions_df is None or len(predictions_df) == 0:
+        print("⚠️ Aucune prédiction à écrire en base")
+        return
+
+    dfp = predictions_df.copy()
+    dfp["date"] = pd.to_datetime(dfp.get("date"), errors="coerce")
+    dfp = dfp[dfp["date"].notna()]
+    dfp = dfp[(dfp["date"] >= pd.Timestamp("2027-01-01")) & (dfp["date"] <= pd.Timestamp("2029-12-31"))]
+    if len(dfp) == 0:
+        print("⚠️ Aucune ligne dans l'intervalle 2027-2029 (rien à écrire)")
+        return
+
+    # Normalisation types
+    dfp["pred_date"] = dfp["date"].dt.date
+    if "année" in dfp.columns:
+        dfp["annee"] = pd.to_numeric(dfp["année"], errors="coerce").fillna(dfp["date"].dt.year).astype(int)
+    else:
+        dfp["annee"] = dfp["date"].dt.year.astype(int)
+    if "mois" in dfp.columns:
+        dfp["mois_int"] = pd.to_numeric(dfp["mois"], errors="coerce").fillna(dfp["date"].dt.month).astype(int)
+    else:
+        dfp["mois_int"] = dfp["date"].dt.month.astype(int)
+
+    # Connexion DB via l'engine existant
+    global _ENGINE
+    if _ENGINE is None:
+        _ENGINE = _get_engine()
+
+    # DDL + UPSERT
+    try:
+        from psycopg2.extras import execute_values  # type: ignore
+    except Exception as e:
+        raise ImportError("psycopg2 est requis pour écrire en base (pip install psycopg2-binary)") from e
+
+    conn = _ENGINE.raw_connection()
+    try:
+        cur = conn.cursor()
+
+        ddl_co2 = f"""
+        CREATE TABLE IF NOT EXISTS {_qident(schema)}.{_qident(co2_table)} (
+            pred_date date NOT NULL,
+            annee integer NOT NULL,
+            mois integer NOT NULL,
+            zone_id integer NOT NULL,
+            zone_name text NULL,
+            mode_transport text NOT NULL,
+            co2_kg_predite double precision NOT NULL,
+            created_at timestamptz NOT NULL DEFAULT now(),
+            PRIMARY KEY (pred_date, zone_id, mode_transport)
+        );
+        """.strip()
+
+        ddl_energy = f"""
+        CREATE TABLE IF NOT EXISTS {_qident(schema)}.{_qident(energy_table)} (
+            pred_date date NOT NULL,
+            annee integer NOT NULL,
+            mois integer NOT NULL,
+            zone_id integer NOT NULL,
+            zone_name text NULL,
+            mode_transport text NOT NULL,
+            energie_kwh_predite double precision NOT NULL,
+            created_at timestamptz NOT NULL DEFAULT now(),
+            PRIMARY KEY (pred_date, zone_id, mode_transport)
+        );
+        """.strip()
+
+        cur.execute(ddl_co2)
+        cur.execute(ddl_energy)
+
+        co2_rows = list(
+            dfp[["pred_date", "annee", "mois_int", "zone_id", "zone_name", "mode_transport", "co2_kg_predite"]]
+            .fillna({"zone_name": ""})
+            .itertuples(index=False, name=None)
+        )
+        energy_rows = list(
+            dfp[["pred_date", "annee", "mois_int", "zone_id", "zone_name", "mode_transport", "energie_kwh_predite"]]
+            .fillna({"zone_name": ""})
+            .itertuples(index=False, name=None)
+        )
+
+        ins_co2 = f"""
+        INSERT INTO {_qident(schema)}.{_qident(co2_table)}
+            (pred_date, annee, mois, zone_id, zone_name, mode_transport, co2_kg_predite)
+        VALUES %s
+        ON CONFLICT (pred_date, zone_id, mode_transport)
+        DO UPDATE SET
+            annee = EXCLUDED.annee,
+            mois = EXCLUDED.mois,
+            zone_name = EXCLUDED.zone_name,
+            co2_kg_predite = EXCLUDED.co2_kg_predite;
+        """.strip()
+
+        ins_energy = f"""
+        INSERT INTO {_qident(schema)}.{_qident(energy_table)}
+            (pred_date, annee, mois, zone_id, zone_name, mode_transport, energie_kwh_predite)
+        VALUES %s
+        ON CONFLICT (pred_date, zone_id, mode_transport)
+        DO UPDATE SET
+            annee = EXCLUDED.annee,
+            mois = EXCLUDED.mois,
+            zone_name = EXCLUDED.zone_name,
+            energie_kwh_predite = EXCLUDED.energie_kwh_predite;
+        """.strip()
+
+        execute_values(cur, ins_co2, co2_rows, page_size=1000)
+        execute_values(cur, ins_energy, energy_rows, page_size=1000)
+
+        conn.commit()
+
+        print("\n✅ Tables PostgreSQL mises à jour:")
+        print(f"  - {schema}.{co2_table}  (lignes upsert: {len(co2_rows):,})")
+        print(f"  - {schema}.{energy_table}  (lignes upsert: {len(energy_rows):,})")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def _is_colab() -> bool:
@@ -67,62 +443,127 @@ def _read_csv(filename: str) -> pd.DataFrame:
     )
 
 
-class QuantileClipper(BaseEstimator, TransformerMixin):
-    def __init__(self, lower_q: float = 0.01, upper_q: float = 0.99):
-        self.lower_q = lower_q
-        self.upper_q = upper_q
-        self.lower_bounds_: np.ndarray | None = None
-        self.upper_bounds_: np.ndarray | None = None
-
-    def fit(self, X, y=None):
-        X_arr = np.asarray(X, dtype=float)
-        self.lower_bounds_ = np.nanquantile(X_arr, self.lower_q, axis=0)
-        self.upper_bounds_ = np.nanquantile(X_arr, self.upper_q, axis=0)
-        return self
-
-    def transform(self, X):
-        X_arr = np.asarray(X, dtype=float)
-        if self.lower_bounds_ is None or self.upper_bounds_ is None:
-            raise RuntimeError("QuantileClipper not fitted")
-        return np.clip(X_arr, self.lower_bounds_, self.upper_bounds_)
 
 # ============ CHARGEMENT DES DONNÉES ============
-print("♻️ OBJECTIF 4: ESTIMER CO2 ET CONSOMMATION ÉNERGÉTIQUE\n")
-print("📊 CHARGEMENT DES DONNÉES...")
+print("[OBJECTIF 4] ESTIMER CO2 ET CONSOMMATION ENERGETIQUE\n")
+print("[DATA] CHARGEMENT DES DONNEES...")
 
-if _is_colab():
+LOADED_FROM_DB = False
+LOADED_FROM_DB_JOIN = False
+SQL_JOIN_QUERY = None
+
+if _db_enabled():
+    print("🗄️ Mode DB: lecture depuis PostgreSQL (variables DB_* détectées)")
+    LOADED_FROM_DB = True
+    schema = os.getenv("DB_SCHEMA", "public")
+
+    # Résolution robuste des noms de tables (supporte fautes de frappe dans la DB)
+    fact_table = _resolve_table(
+        preferred="fact_energieconsomation",
+        schema=schema,
+        like_patterns=["fact_energie%", "fact_energi%", "fact_energiec%"],
+    )
+    dim_em_table = _resolve_table(
+        preferred="dim_emission_co2",
+        schema=schema,
+        like_patterns=[
+            "dim_emission%",
+            "dim_em_%co2%",
+            "dim_em_emission%",
+            "dim_emco2%",
+        ],
+    )
+    dim_en_table = _resolve_table(
+        preferred="dim_energietransport",
+        schema=schema,
+        like_patterns=["dim_energie%", "dim_energi%"],
+    )
+    dim_zone_table = _resolve_table(
+        preferred="dim_zone",
+        schema=schema,
+        like_patterns=["dim_zone%"],
+    )
+
+    if fact_table is None:
+        raise RuntimeError(
+            "Table fact introuvable dans la DB (schema public). "
+            "Vérifie le nom (ex: fact_energieconsomation / fact_energiecondomation)."
+        )
+
+    print("\n📌 Tables DB utilisées:")
+    print(f"  - fact: {schema}.{fact_table}")
+    if dim_em_table:
+        print(f"  - dim_emission: {schema}.{dim_em_table}")
+    else:
+        print("  - dim_emission: (non trouvée)")
+    if dim_en_table:
+        print(f"  - dim_energie: {schema}.{dim_en_table}")
+    else:
+        print("  - dim_energie: (non trouvée)")
+    if dim_zone_table:
+        print(f"  - dim_zone: {schema}.{dim_zone_table}")
+    else:
+        print("  - dim_zone: (non trouvée)")
+
+    # Charger les tables (pour exploration/logs)
+    fact_energieconsomation = _read_table(fact_table, schema=schema)
+    dim_emission_co2 = _read_table(dim_em_table, schema=schema) if dim_em_table else pd.DataFrame()
+    dim_energietransport = _read_table(dim_en_table, schema=schema) if dim_en_table else pd.DataFrame()
+    dim_zone = _read_table(dim_zone_table, schema=schema) if dim_zone_table else None
+
+    # Optionnel
     try:
-        from google.colab import files  # type: ignore
-
-        _ = files.upload()
+        fact_pollution = _read_table("fact_pollution", schema=schema)
     except Exception:
-        pass
+        fact_pollution = None
 
-# Charger les données
-fact_energieconsomation = _read_csv('fact_energieconsomation.csv')
-dim_emission_co2 = _read_csv('dim_emission_co2.csv')
-dim_energietransport = _read_csv('dim_energietransport.csv')
+    # Requête jointe recommandée (peut échouer si fk_zone n'existe pas, etc.)
+    joined_df, SQL_JOIN_QUERY = _try_read_joined_fact(
+        schema=schema,
+        fact_table=fact_table,
+        dim_emission_table=dim_em_table,
+        dim_energie_table=dim_en_table,
+        dim_zone_table=dim_zone_table,
+    )
+    if joined_df is not None:
+        df = joined_df
+        LOADED_FROM_DB_JOIN = True
+        print("✓ Requête SQL jointe exécutée (fact + dimensions)")
+        print("\n🧾 Requête SQL utilisée:")
+        print(SQL_JOIN_QUERY)
+    else:
+        # Fallback: on utilisera les merges pandas plus bas
+        df = fact_energieconsomation.copy()
+        print("⚠️ Requête SQL jointe non disponible; fallback merges pandas")
 
-# CHARGER DIM_ZONE POUR LES NOMS DE ZONES
-try:
-    dim_zone = _read_csv('dim_zone.csv')
-    zone_name_mapping = dict(zip(dim_zone['zone_id'], dim_zone['zone_name'])) if 'zone_name' in dim_zone.columns else {}
+else:
+    raise RuntimeError(
+        "Mode fichiers désactivé. Ce script est configuré pour utiliser PostgreSQL uniquement. "
+        "Vérifie DB_HOST/DB_PORT/DB_NAME/DB_USER/DB_PASSWORD (par défaut: localhost/5432/urbain_dw/postgres)."
+    )
+
+# Mapping noms de zones si dispo
+if dim_zone is not None and isinstance(dim_zone, pd.DataFrame) and len(dim_zone) > 0:
+    zone_id_col = 'zone_id' if 'zone_id' in dim_zone.columns else None
+    zone_name_col = 'zone_name' if 'zone_name' in dim_zone.columns else (
+        'zone_nom' if 'zone_nom' in dim_zone.columns else None
+    )
+    if zone_id_col and zone_name_col:
+        zone_name_mapping = dict(zip(dim_zone[zone_id_col], dim_zone[zone_name_col]))
+    else:
+        zone_name_mapping = {}
     print(f"✓ dim_zone chargé: {dim_zone.shape}")
     print(f"  Colonnes: {list(dim_zone.columns)}")
-except:
-    dim_zone = None
+else:
     zone_name_mapping = {}
     print("⚠️ dim_zone non disponible - utilisation des IDs")
 
 print(f"✓ fact_energieconsomation chargé: {fact_energieconsomation.shape}")
 print(f"✓ dim_emission_co2 chargé: {dim_emission_co2.shape}")
 print(f"✓ dim_energietransport chargé: {dim_energietransport.shape}")
-
-try:
-    fact_pollution = _read_csv('fact_pollution.csv')
+if fact_pollution is not None:
     print(f"✓ fact_pollution chargé: {fact_pollution.shape}")
-except:
-    fact_pollution = None
+else:
     print("⚠️ fact_pollution non disponible")
 
 # ============ EXPLORATION DES DONNÉES ============
@@ -143,11 +584,12 @@ print(dim_energietransport.head())
 # ============ PRÉPARATION DES DONNÉES ============
 print("\n🔧 PRÉPARATION DES DONNÉES...")
 
-# Fusion des données
-df = fact_energieconsomation.copy()
+# Fusion des données (si df n'est pas déjà enrichi via SQL JOIN)
+if not LOADED_FROM_DB_JOIN:
+    df = df.copy()
 
 # Joindre dim_emission_co2 - utiliser seulement les colonnes disponibles
-if 'fk_emco2' in df.columns:
+if (not LOADED_FROM_DB_JOIN) and ('fk_emco2' in df.columns):
     emco2_cols = ['emission_id']
     if 'mode' in dim_emission_co2.columns:
         emco2_cols.append('mode')
@@ -158,7 +600,7 @@ if 'fk_emco2' in df.columns:
                       left_on='fk_emco2', right_on='emission_id', how='left')
 
 # Joindre dim_energietransport - utiliser seulement les colonnes disponibles
-if 'fk_energie' in df.columns:
+if (not LOADED_FROM_DB_JOIN) and ('fk_energie' in df.columns):
     energie_cols = ['energie_id']
     if 'type_energie' in dim_energietransport.columns:
         energie_cols.append('type_energie')
@@ -170,6 +612,16 @@ if 'fk_energie' in df.columns:
                           left_on='fk_energie', right_on='energie_id', how='left')
         except:
             print("⚠️ Merge dim_energietransport impossible")
+
+# Joindre dim_zone si possible (pour zone_name)
+if (not LOADED_FROM_DB_JOIN) and (dim_zone is not None) and isinstance(dim_zone, pd.DataFrame):
+    try:
+        if 'fk_zone' in df.columns and 'zone_id' in dim_zone.columns:
+            keep = ['zone_id'] + ([c for c in ['zone_name', 'zone_nom'] if c in dim_zone.columns][:1])
+            if len(keep) > 1:
+                df = df.merge(dim_zone[keep], left_on='fk_zone', right_on='zone_id', how='left')
+    except Exception:
+        pass
 
 # Traiter les données manquantes
 print(f"\nValeurs manquantes avant nettoyage:")
@@ -303,49 +755,59 @@ def _train_compare_for_target(target_col: str):
         X_all, y_all, test_size=0.2, random_state=42
     )
 
-    cv = KFold(n_splits=5, shuffle=True, random_state=42)
+    # Mode rapide: on réduit fortement le tuning (beaucoup plus rapide)
+    cv = KFold(n_splits=3 if FAST_MODE else 5, shuffle=True, random_state=42)
 
-    # Modèle 1: Ridge (GridSearch)
+    # Modèle 1: Ridge (toujours)
     ridge_pipe = Pipeline(steps=[('prep', preprocess), ('reg', Ridge())])
-    ridge_grid = {'reg__alpha': [0.1, 1.0, 10.0, 50.0]}
-    ridge_search = GridSearchCV(ridge_pipe, ridge_grid, cv=cv, scoring='neg_root_mean_squared_error', n_jobs=-1)
-
-    # Modèle 2: RandomForest (RandomizedSearch)
-    rf_pipe = Pipeline(steps=[('prep', preprocess), ('reg', RandomForestRegressor(random_state=42))])
-    rf_dist = {
-        'reg__n_estimators': [300, 600],
-        'reg__max_depth': [None, 8, 14, 20],
-        'reg__min_samples_split': [2, 5, 10],
-        'reg__min_samples_leaf': [1, 2, 4],
-        'reg__max_features': ['sqrt', 0.7, 1.0],
-    }
-    rf_search = RandomizedSearchCV(
-        rf_pipe,
-        rf_dist,
-        n_iter=12,
+    ridge_grid = {'reg__alpha': ([1.0, 10.0] if FAST_MODE else [0.1, 1.0, 10.0, 50.0])}
+    ridge_search = GridSearchCV(
+        ridge_pipe,
+        ridge_grid,
         cv=cv,
         scoring='neg_root_mean_squared_error',
-        random_state=42,
         n_jobs=-1,
     )
 
-    # Modèle 3: LinearSVR (RandomizedSearch)
-    svr_pipe = Pipeline(steps=[('prep', preprocess), ('reg', LinearSVR(max_iter=8000, random_state=42))])
-    svr_dist = {
-        'reg__C': [0.1, 1.0, 5.0, 10.0],
-        'reg__epsilon': [0.0, 0.05, 0.1, 0.2],
-    }
-    svr_search = RandomizedSearchCV(
-        svr_pipe,
-        svr_dist,
-        n_iter=10,
-        cv=cv,
-        scoring='neg_root_mean_squared_error',
-        random_state=42,
-        n_jobs=-1,
-    )
+    searches = [('Ridge', ridge_search)]
 
-    searches = [('Ridge', ridge_search), ('RandomForest', rf_search), ('LinearSVR', svr_search)]
+    if not FAST_MODE:
+        # Modèle 2: RandomForest (RandomizedSearch)
+        rf_pipe = Pipeline(steps=[('prep', preprocess), ('reg', RandomForestRegressor(random_state=42))])
+        rf_dist = {
+            'reg__n_estimators': [300, 600],
+            'reg__max_depth': [None, 8, 14, 20],
+            'reg__min_samples_split': [2, 5, 10],
+            'reg__min_samples_leaf': [1, 2, 4],
+            'reg__max_features': ['sqrt', 0.7, 1.0],
+        }
+        rf_search = RandomizedSearchCV(
+            rf_pipe,
+            rf_dist,
+            n_iter=12,
+            cv=cv,
+            scoring='neg_root_mean_squared_error',
+            random_state=42,
+            n_jobs=-1,
+        )
+
+        # Modèle 3: LinearSVR (RandomizedSearch)
+        svr_pipe = Pipeline(steps=[('prep', preprocess), ('reg', LinearSVR(max_iter=8000, random_state=42))])
+        svr_dist = {
+            'reg__C': [0.1, 1.0, 5.0, 10.0],
+            'reg__epsilon': [0.0, 0.05, 0.1, 0.2],
+        }
+        svr_search = RandomizedSearchCV(
+            svr_pipe,
+            svr_dist,
+            n_iter=10,
+            cv=cv,
+            scoring='neg_root_mean_squared_error',
+            random_state=42,
+            n_jobs=-1,
+        )
+
+        searches = [('Ridge', ridge_search), ('RandomForest', rf_search), ('LinearSVR', svr_search)]
     best_name = None
     best_est = None
     best_rmse = float('inf')
@@ -372,78 +834,114 @@ def _train_compare_for_target(target_col: str):
     print(results_df[['model', 'RMSE', 'MAE', 'R2']].to_string(index=False))
 
     # Visualisation — comparaison des modèles (barres RMSE/MAE/R2)
-    try:
-        cmp_plot = results_df[['model', 'RMSE', 'MAE', 'R2']].copy()
-        cmp_plot = cmp_plot.melt(id_vars='model', var_name='metric', value_name='value')
-        plt.figure(figsize=(9.5, 4.8))
-        sns.barplot(data=cmp_plot, x='metric', y='value', hue='model')
-        plt.title(f"Comparaison des modèles — {target_col} (test set)")
-        plt.xlabel('Métrique')
-        plt.ylabel('Valeur')
-        plt.tight_layout()
-        safe_target = target_col.replace('/', '_')
-        plt.savefig(f"Objectif4_{safe_target}_Model_Comparison.png", dpi=220, bbox_inches='tight')
-        plt.show()
-    except Exception as e:
-        print(f"⚠️ Plot comparaison modèles indisponible pour {target_col}: {e}")
+    if not ONLY_DB:
+        try:
+            cmp_plot = results_df[['model', 'RMSE', 'MAE', 'R2']].copy()
+            cmp_plot = cmp_plot.melt(id_vars='model', var_name='metric', value_name='value')
+            plt.figure(figsize=(9.5, 4.8))
+            sns.barplot(data=cmp_plot, x='metric', y='value', hue='model')
+            plt.title(f"Comparaison des modèles — {target_col} (test set)")
+            plt.xlabel('Métrique')
+            plt.ylabel('Valeur')
+            plt.tight_layout()
+            safe_target = target_col.replace('/', '_')
+            plt.savefig(f"Objectif4_{safe_target}_Model_Comparison.png", dpi=220, bbox_inches='tight')
+            plt.show()
+        except Exception as e:
+            print(f"⚠️ Plot comparaison modèles indisponible pour {target_col}: {e}")
 
     if best_est is None or best_name is None:
         raise RuntimeError("Aucun modèle entraîné")
     print(f"\n✅ Modèle retenu pour {target_col}: {best_name} (RMSE={best_rmse:.3f})")
 
-    # Visualisations: résidus + actual vs predicted
-    best_pred = best_est.predict(X_test)
-    residuals = y_test - best_pred
+    if not ONLY_DB:
+        # Visualisations: résidus + actual vs predicted
+        best_pred = best_est.predict(X_test)
+        residuals = y_test - best_pred
 
-    fig, ax = plt.subplots(1, 2, figsize=(12, 4.5))
-    ax[0].scatter(best_pred, residuals, alpha=0.35)
-    ax[0].axhline(0, color='red', linestyle='--', linewidth=1)
-    ax[0].set_title(f"Residuals plot — {target_col} ({best_name})")
-    ax[0].set_xlabel('Predicted')
-    ax[0].set_ylabel('Residuals')
-    ax[1].scatter(y_test, best_pred, alpha=0.35)
-    lims = [min(y_test.min(), best_pred.min()), max(y_test.max(), best_pred.max())]
-    ax[1].plot(lims, lims, 'r--', linewidth=1)
-    ax[1].set_title(f"Actual vs Predicted — {target_col} ({best_name})")
-    ax[1].set_xlabel('Actual')
-    ax[1].set_ylabel('Predicted')
-    plt.tight_layout()
-    safe_target = target_col.replace('/', '_')
-    plt.savefig(f"Objectif4_{safe_target}_Residuals_ActualVsPred.png", dpi=200, bbox_inches='tight')
-    plt.show()
+        fig, ax = plt.subplots(1, 2, figsize=(12, 4.5))
+        ax[0].scatter(best_pred, residuals, alpha=0.35)
+        ax[0].axhline(0, color='red', linestyle='--', linewidth=1)
+        ax[0].set_title(f"Residuals plot — {target_col} ({best_name})")
+        ax[0].set_xlabel('Predicted')
+        ax[0].set_ylabel('Residuals')
+        ax[1].scatter(y_test, best_pred, alpha=0.35)
+        lims = [min(y_test.min(), best_pred.min()), max(y_test.max(), best_pred.max())]
+        ax[1].plot(lims, lims, 'r--', linewidth=1)
+        ax[1].set_title(f"Actual vs Predicted — {target_col} ({best_name})")
+        ax[1].set_xlabel('Actual')
+        ax[1].set_ylabel('Predicted')
+        plt.tight_layout()
+        safe_target = target_col.replace('/', '_')
+        plt.savefig(f"Objectif4_{safe_target}_Residuals_ActualVsPred.png", dpi=200, bbox_inches='tight')
+        plt.show()
 
-    # Explainability: coefficients or feature importance
-    try:
-        prep = best_est.named_steps['prep']
-        reg = best_est.named_steps['reg']
-        feature_names = prep.get_feature_names_out()
-        if hasattr(reg, 'feature_importances_'):
-            imp = pd.DataFrame({'feature': feature_names, 'importance': reg.feature_importances_}).sort_values('importance', ascending=False).head(20)
-            plt.figure(figsize=(10, 6))
-            sns.barplot(data=imp, y='feature', x='importance', color='#4c72b0')
-            plt.title(f"Top 20 Feature Importance — {target_col} ({best_name})")
-            plt.tight_layout()
-            plt.savefig(f"Objectif4_{safe_target}_FeatureImportance.png", dpi=200, bbox_inches='tight')
-            plt.show()
-        elif hasattr(reg, 'coef_'):
-            coef = np.asarray(reg.coef_).ravel()
-            coef_df = pd.DataFrame({'feature': feature_names, 'coef': coef})
-            coef_df['abs_coef'] = coef_df['coef'].abs()
-            top = coef_df.sort_values('abs_coef', ascending=False).head(20)
-            plt.figure(figsize=(10, 6))
-            sns.barplot(data=top, y='feature', x='coef', palette='vlag')
-            plt.title(f"Top 20 Coefficients — {target_col} ({best_name})")
-            plt.tight_layout()
-            plt.savefig(f"Objectif4_{safe_target}_Coefficients.png", dpi=200, bbox_inches='tight')
-            plt.show()
-    except Exception as e:
-        print(f"⚠️ Explainability indisponible pour {target_col}: {e}")
+        # Explainability: coefficients or feature importance
+        try:
+            prep = best_est.named_steps['prep']
+            reg = best_est.named_steps['reg']
+            feature_names = prep.get_feature_names_out()
+            if hasattr(reg, 'feature_importances_'):
+                imp = pd.DataFrame({'feature': feature_names, 'importance': reg.feature_importances_}).sort_values('importance', ascending=False).head(20)
+                plt.figure(figsize=(10, 6))
+                sns.barplot(data=imp, y='feature', x='importance', color='#4c72b0')
+                plt.title(f"Top 20 Feature Importance — {target_col} ({best_name})")
+                plt.tight_layout()
+                plt.savefig(f"Objectif4_{safe_target}_FeatureImportance.png", dpi=200, bbox_inches='tight')
+                plt.show()
+            elif hasattr(reg, 'coef_'):
+                coef = np.asarray(reg.coef_).ravel()
+                coef_df = pd.DataFrame({'feature': feature_names, 'coef': coef})
+                coef_df['abs_coef'] = coef_df['coef'].abs()
+                top = coef_df.sort_values('abs_coef', ascending=False).head(20)
+                plt.figure(figsize=(10, 6))
+                sns.barplot(data=top, y='feature', x='coef', palette='vlag')
+                plt.title(f"Top 20 Coefficients — {target_col} ({best_name})")
+                plt.tight_layout()
+                plt.savefig(f"Objectif4_{safe_target}_Coefficients.png", dpi=200, bbox_inches='tight')
+                plt.show()
+        except Exception as e:
+            print(f"⚠️ Explainability indisponible pour {target_col}: {e}")
 
     return best_est
 
 
 best_model_co2 = _train_compare_for_target('co2_kg')
 best_model_energy = _train_compare_for_target('energie_kwh') if target_energy else None
+
+
+def _mlops_export_objective4() -> None:
+    if os.getenv("MLOPS_EXPORT", "0").strip().lower() not in ("1", "true", "yes"):
+        return
+
+    from mlops.registry import register_model
+
+    if "feature_cols" not in globals() or "best_model_co2" not in globals():
+        print("⚠️ MLOps export ignoré: variables manquantes (feature_cols/best_model_co2).")
+        return
+
+    models = {"co2_kg": best_model_co2}
+    targets = ["co2_kg"]
+    if best_model_energy is not None:
+        models["energie_kwh"] = best_model_energy
+        targets.append("energie_kwh")
+
+    bundle = {"models": models}
+    meta = {
+        "feature_cols": list(feature_cols),
+        "targets": targets,
+        "fast_mode": bool(FAST_MODE),
+        "only_db": bool(ONLY_DB),
+    }
+
+    try:
+        entry = register_model("objective4", bundle, meta)
+        print({"status": "success", "objective": "objective4", "version": entry.version})
+    except Exception as e:
+        print({"status": "error", "message": f"MLOps export failed: {e}"})
+
+
+_mlops_export_objective4()
 
 # ============================
 # Génération des prédictions futures (36 mois)
@@ -458,7 +956,8 @@ if df['date'].notna().any():
 else:
     max_date = pd.Timestamp.today().normalize()
 
-future_dates = pd.date_range(start=max_date + timedelta(days=1), periods=36, freq='MS')
+# Période demandée: 2027, 2028, 2029 (36 mois)
+future_dates = pd.date_range(start=pd.Timestamp("2027-01-01"), periods=36, freq='MS')
 
 zones_uniques = sorted(df['zone_id'].dropna().unique()) if 'zone_id' in df.columns else [1, 2, 3, 4, 5]
 modes_uniques = sorted(df['mode'].dropna().unique()) if 'mode' in df.columns else ['Bus', 'Tram', 'Métro']
@@ -534,8 +1033,18 @@ for date in future_dates:
 
 predictions_df = pd.DataFrame(predictions_list)
 
+# Écriture dans PostgreSQL (2 tables) — années 2027-2029
+try:
+    _write_predictions_to_postgres(predictions_df)
+except Exception as e:
+    print(f"⚠️ Écriture PostgreSQL ignorée (erreur): {e}")
+
 print(f"\n✓ {len(predictions_df):,} prédictions générées")
 print(f"✓ Période: {predictions_df['date'].min().strftime('%Y-%m-%d')} à {predictions_df['date'].max().strftime('%Y-%m-%d')}")
+
+if ONLY_DB:
+    print("\n✅ Terminé (ONLY_DB=1): tables écrites dans PostgreSQL, rapport/visualisations ignorés.")
+    raise SystemExit(0)
 
 # ============ 📊 STATISTIQUES DES PRÉDICTIONS (AMÉLIORÉES) ============
 print("\n" + "="*70)
@@ -834,35 +1343,56 @@ for bar in bars_energie:
 ax11 = fig_energie.add_subplot(gs_energie[2, 2])
 
 # Calculer l'efficacité écologique (ratio CO2/Énergie) par mode
+# IMPORTANT (robustesse export): on borne la taille des bulles pour éviter des figures énormes.
 efficiency_data = []
 for mode in predictions_df['mode_transport'].unique():
     mode_data = predictions_df[predictions_df['mode_transport'] == mode]
-    total_energy = mode_data['energie_kwh_predite'].sum() / 1e6  # MWh
-    total_co2 = mode_data['co2_kg_predite'].sum() / 1000  # Tonnes
-    
-    # Ratio CO2 par MWh consommé (plus bas = plus écologique)
-    ratio = total_co2 / total_energy if total_energy > 0 else 0
-    efficiency_data.append({'mode': str(mode)[:15], 'ratio': ratio, 'energy': total_energy, 'co2': total_co2})
+    total_energy_kwh = float(mode_data['energie_kwh_predite'].sum())
+    total_co2_kg = float(mode_data['co2_kg_predite'].sum())
 
-efficiency_df = pd.DataFrame(efficiency_data).sort_values('ratio')
+    # Conversion: MWh = kWh / 1e3 ; ratio en kg CO2 / MWh (plus bas = plus écologique)
+    total_energy_mwh = total_energy_kwh / 1e3
+    total_co2_tonnes = total_co2_kg / 1000.0
+    ratio_kg_per_mwh = (total_co2_kg / total_energy_mwh) if total_energy_mwh > 0 else np.nan
 
-# Bubble chart : x=énergie, y=CO2, size=ratio
-colors_eco = []
-for ratio in efficiency_df['ratio']:
-    if ratio < 0.1:
-        colors_eco.append('#27ae60')  # Vert (très éco)
-    elif ratio < 0.3:
-        colors_eco.append('#f39c12')  # Orange (moyen)
-    else:
-        colors_eco.append('#c0392b')  # Rouge (pollutant)
+    efficiency_data.append(
+        {
+            'mode': str(mode)[:15],
+            'ratio_kg_per_mwh': ratio_kg_per_mwh,
+            'energy_mwh': total_energy_mwh,
+            'co2_tonnes': total_co2_tonnes,
+        }
+    )
 
-scatter = ax11.scatter(efficiency_df['energy'], efficiency_df['co2'], 
-                      s=efficiency_df['ratio']*1000 + 100, c=efficiency_df['ratio'], 
-                      cmap='RdYlGn_r', alpha=0.7, edgecolors='#2c3e50', linewidth=2)
+efficiency_df = pd.DataFrame(efficiency_data).sort_values('ratio_kg_per_mwh')
+efficiency_df = efficiency_df.replace([np.inf, -np.inf], np.nan).dropna(subset=['ratio_kg_per_mwh'])
+
+# Bubble chart : x=énergie, y=CO2, size=ratio (normalisé + borné)
+if len(efficiency_df) > 0:
+    r = efficiency_df['ratio_kg_per_mwh'].to_numpy(dtype=float)
+    r_min = float(np.nanmin(r))
+    r_max = float(np.nanmax(r))
+    denom = (r_max - r_min) if (r_max > r_min) else 1.0
+    r_norm = (r - r_min) / denom
+    # tailles en points^2, bornées pour éviter les exports monstrueux
+    sizes = 200.0 + 900.0 * np.clip(r_norm, 0.0, 1.0)
+
+    scatter = ax11.scatter(
+        efficiency_df['energy_mwh'],
+        efficiency_df['co2_tonnes'],
+        s=sizes,
+        c=efficiency_df['ratio_kg_per_mwh'],
+        cmap='RdYlGn_r',
+        alpha=0.75,
+        edgecolors='#2c3e50',
+        linewidth=2,
+    )
+else:
+    scatter = None
 
 # Ajouter labels sur points
 for idx, row in efficiency_df.iterrows():
-    ax11.annotate(row['mode'], (row['energy'], row['co2']), 
+    ax11.annotate(row['mode'], (row['energy_mwh'], row['co2_tonnes']), 
                  fontsize=9, fontweight='bold', ha='center', va='center')
 
 ax11.set_xlabel('Énergie Totale (MWh)', fontsize=12, fontweight='bold')
@@ -872,13 +1402,30 @@ ax11.grid(True, alpha=0.3, linestyle='--')
 ax11.set_facecolor('#f8f9fa')
 
 # Colorbar
-cbar = plt.colorbar(scatter, ax=ax11)
-cbar.set_label('CO2/MWh (kg/MWh)', fontweight='bold')
+if scatter is not None:
+    cbar = plt.colorbar(scatter, ax=ax11)
+    cbar.set_label('kg CO2 / MWh', fontweight='bold')
 fig_energie.suptitle('⚡ RAPPORT COMPLET - ANALYSE DE LA CONSOMMATION ÉNERGÉTIQUE - PRÉDICTIONS 36 MOIS (AMÉLIORÉ)', 
                      fontsize=19, fontweight='bold', y=0.998)
 fig_energie.patch.set_facecolor('white')
 
-plt.savefig('Visualisations_Energie_Professional.png', dpi=300, bbox_inches='tight', facecolor='white', edgecolor='none')
+try:
+    fig_energie.savefig(
+        'Visualisations_Energie_Professional.png',
+        dpi=220,
+        bbox_inches='tight',
+        facecolor='white',
+        edgecolor='none',
+    )
+except ValueError as e:
+    print(f"⚠️ Export tight échoué ({e}). Export sans bbox_inches='tight' ...")
+    fig_energie.savefig(
+        'Visualisations_Energie_Professional.png',
+        dpi=180,
+        facecolor='white',
+        edgecolor='none',
+    )
+
 print("✓ Énergie Professional (AMÉLIORÉ avec efficacité écologique): Visualisations_Energie_Professional.png")
 plt.show()
 

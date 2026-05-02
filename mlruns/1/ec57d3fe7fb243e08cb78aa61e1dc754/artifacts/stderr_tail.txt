@@ -1,0 +1,8 @@
+Traceback (most recent call last):
+  File "C:\Users\user\Downloads\colab_notebooks\Objectif2_Recommandation_Trajets_V2.py", line 180, in <module>
+    print("\U0001f5fa\ufe0f OBJECTIF 2: MEILLEURS TRAJETS - ANALYSE PROFESSIONNELLE")
+    ~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\user\AppData\Local\Programs\Python\Python314\Lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+           ~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode characters in position 0-1: character maps to <undefined>

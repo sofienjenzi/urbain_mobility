@@ -1,0 +1,159 @@
+♻️ OBJECTIF 4: ESTIMER CO2 ET CONSOMMATION ÉNERGÉTIQUE
+
+📊 CHARGEMENT DES DONNÉES...
+🗄️ Mode DB: lecture depuis PostgreSQL (variables DB_* détectées)
+
+📌 Tables DB utilisées:
+  - fact: public.fact_energiecondomation
+  - dim_emission: public.dim_emission_co2
+  - dim_energie: public.dim_energietransport
+  - dim_zone: public.dim_zone
+✓ Requête SQL jointe exécutée (fact + dimensions)
+
+🧾 Requête SQL utilisée:
+SELECT
+    f.*,
+    e.mode,
+    e.activity_type,
+    z.zone_nom AS zone_name
+FROM "public"."fact_energiecondomation" f
+LEFT JOIN "public"."dim_emission_co2" e ON f.fk_emco2 = e.emission_id
+LEFT JOIN "public"."dim_zone" z ON f.fk_zone = z.zone_id
+;
+✓ dim_zone chargé: (31, 6)
+  Colonnes: ['zone_id', 'zone_nom', 'ville', 'region', 'pays', 'zone_sk']
+✓ fact_energieconsomation chargé: (1149, 12)
+✓ dim_emission_co2 chargé: (2742, 4)
+✓ dim_energietransport chargé: (26475, 6)
+✓ fact_pollution chargé: (79205, 5)
+
+📈 EXPLORATION DES DONNÉES...
+
+Structure fact_energieconsomation:
+Colonnes: ['fk_emco2', 'fk_zone', 'fk_ligne', 'fk_arret', 'fk_station_metric', 'activity_value', 'emission_factor', 'co2_kg', 'dechets_kg', 'station_kwh', 'fk_energie', 'energie_kwh']
+   fk_emco2  fk_zone  fk_ligne  ...  station_kwh  fk_energie  energie_kwh
+0       523        1         8  ...   533.457764         562     6.758667
+1       524        1        19  ...   533.457764         571     3.354333
+2       525        1        18  ...   533.457764         569     9.933333
+3       526        1        20  ...   533.457764         561     6.895000
+4       527        2         8  ...   343.792847         562     6.758667
+5       528        2        19  ...   343.792847         571     3.354333
+6       529        2        18  ...   343.792847         569     9.933333
+7       530        2        20  ...   343.792847         561     6.895000
+8       535        4         8  ...   337.949097         562     6.758667
+9       536        4        19  ...   337.949097         571     3.354333
+
+[10 rows x 12 columns]
+          fk_emco2      fk_zone  ...    fk_energie  energie_kwh
+count  1149.000000  1149.000000  ...   1149.000000  1149.000000
+mean   1622.301131     4.160139  ...  13456.346388     6.539305
+std     643.953022     2.114438  ...   7685.835696     2.499992
+min     523.000000     1.000000  ...    561.000000     2.500000
+25%    1052.000000     2.000000  ...   6540.000000     4.837000
+50%    1611.000000     4.000000  ...  13122.000000     6.588000
+75%    2186.000000     6.000000  ...  20293.000000     7.380000
+max    2723.000000     7.000000  ...  26475.000000    16.278667
+
+[8 rows x 12 columns]
+
+Structure dim_emission_co2:
+Colonnes: ['emission_id', 'mode', 'activity_type', 'emco2_sk']
+   emission_id     mode      activity_type  emco2_sk
+0          127  voiture  fuel_liters_proxy    139331
+1          128  voiture  fuel_liters_proxy    139332
+2          129  voiture  fuel_liters_proxy    139333
+3          130  voiture  fuel_liters_proxy    139334
+4          131  voiture  fuel_liters_proxy    139335
+
+Structure dim_energietransport:
+Colonnes: ['energy_id', 'date', 'annee', 'mois', 'mode', 'energie_sk']
+   energy_id        date   annee  mois   mode  energie_sk
+0         77  2019-01-04  2019.0   1.0  métro      107155
+1         80  2019-01-04  2019.0   1.0  métro      107158
+2         85  2019-01-05  2019.0   1.0  métro      107163
+3         86  2019-01-05  2019.0   1.0  métro      107164
+4         95  2019-01-05  2019.0   1.0  métro      107173
+
+🔧 PRÉPARATION DES DONNÉES...
+
+Valeurs manquantes avant nettoyage:
+fk_emco2              0
+fk_zone               0
+fk_ligne              0
+fk_arret              0
+fk_station_metric     0
+activity_value        0
+emission_factor       0
+co2_kg               12
+dechets_kg           12
+station_kwh           0
+fk_energie            0
+energie_kwh           0
+mode                  0
+activity_type         0
+zone_name             0
+dtype: int64
+
+Colonnes numériques trouvées: ['activity_value', 'emission_factor', 'co2_kg', 'dechets_kg', 'station_kwh', 'energie_kwh']
+
+✓ Dataset après nettoyage: (1125, 6)
+Statistiques descriptives:
+       activity_value  emission_factor  ...  station_kwh  energie_kwh
+count     1125.000000      1125.000000  ...  1125.000000  1125.000000
+mean        75.824396         0.933680  ...   398.419701     6.531855
+std         41.468192         1.242804  ...   154.440126     2.496493
+min          6.372000         0.050000  ...     0.000000     2.500000
+25%         41.663000         0.050000  ...   295.949097     4.837000
+50%         69.436000         0.050000  ...   398.630524     6.588000
+75%        107.581000         2.680000  ...   505.867371     7.380000
+max        232.278000         2.680000  ...   804.449036    16.278667
+
+[8 rows x 6 columns]
+
+======================================================================
+🧠 COMPRÉHENSION DU MODÈLE (B)
+======================================================================
+Problème: prédire des variables continues (CO2, énergie). On compare 3 modèles de régression:
+- Ridge (linéaire régularisé): interprétable, rapide, hypothèse de relation ~linéaire.
+- Random Forest: non-linéaire, capte interactions, robuste, mais moins interprétable.
+- LinearSVR: modèle à marge (support vector) adapté aux données hautement dimensionnelles.
+Choix basé sur RMSE/MAE/R² sur un jeu de test + validation K-Fold.
+
+======================================================================
+🧹 DATA PREPARATION & FEATURE ENGINEERING (A)
+======================================================================
+✓ Features utilisées: ['activity_value', 'emission_factor', 'dechets_kg', 'station_kwh', 'year', 'month', 'mode', 'activity_type']
+
+----------------------------------------------------------------------
+🎯 RÉGRESSION (D) — cible: co2_kg
+----------------------------------------------------------------------
+🔎 Tuning: Ridge ...
+model                        Ridge
+best_params    {'reg__alpha': 1.0}
+MSE                    2930.670358
+RMSE                     54.135666
+MAE                      38.501267
+R2                        0.823965
+
+📌 Comparaison (test set):
+model      RMSE       MAE       R2
+Ridge 54.135666 38.501267 0.823965
+
+✅ Modèle retenu pour co2_kg: Ridge (RMSE=54.136)
+
+----------------------------------------------------------------------
+🎯 RÉGRESSION (D) — cible: energie_kwh
+----------------------------------------------------------------------
+🔎 Tuning: Ridge ...
+model                        Ridge
+best_params    {'reg__alpha': 1.0}
+MSE                       3.268933
+RMSE                      1.808019
+MAE                       1.139166
+R2                        0.524776
+
+📌 Comparaison (test set):
+model     RMSE      MAE       R2
+Ridge 1.808019 1.139166 0.524776
+
+✅ Modèle retenu pour energie_kwh: Ridge (RMSE=1.808)

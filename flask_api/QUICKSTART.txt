@@ -1,0 +1,222 @@
+"""
+GUIDE DE DÉMARRAGE RAPIDE - Flask API Classification des Risques
+"""
+
+╔════════════════════════════════════════════════════════════════════════════╗
+║         🚀 FLASK API - CLASSIFICATION DES RISQUES URBAINS                 ║
+║                    (Accidents, Criminalité)                              ║
+╚════════════════════════════════════════════════════════════════════════════╝
+
+
+📋 PRÉREQUIS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+✓ Python 3.9+
+✓ Base de données PostgreSQL (déjà configurée)
+✓ pip (gestionnaire de packages Python)
+
+
+⚡ DÉMARRAGE RAPIDE (Windows)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. Éditer le fichier .env
+   ├─ Copier .env.example → .env
+   └─ Configurer les identifiants PostgreSQL
+
+2. Démarrer l'API
+   └─ Double-cliquer: run.bat
+      OU en terminal: python app.py
+
+3. Tester les endpoints
+   └─ Double-cliquer: test.bat
+      OU en terminal: python test_api.py
+
+4. Accéder à l'API
+   └─ http://localhost:5000/health
+
+
+⚡ DÉMARRAGE RAPIDE (Linux/Mac)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. Éditer le fichier .env
+   ├─ cp .env.example .env
+   └─ Configurer les identifiants PostgreSQL
+
+2. Rendre les scripts exécutables
+   ├─ chmod +x run.sh test.sh
+   └─ (une fois seulement)
+
+3. Démarrer l'API
+   └─ ./run.sh
+
+4. Tester les endpoints (dans un autre terminal)
+   └─ ./test.sh
+
+
+📝 STRUCTURE DES FICHIERS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+flask_api/
+├── app.py                      # 🚀 Application Flask + endpoints
+├── config.py                   # ⚙️  Configuration
+├── database.py                 # 🗄️  Gestion PostgreSQL
+├── ml_model.py                # 🧠 Modèle ML
+├── requirements.txt            # 📦 Dépendances Python
+├── .env.example                # 📋 Modèle de configuration
+├── .env                        # 🔐 Configuration réelle (à créer)
+├── run.bat / run.sh           # ▶️  Démarrer l'API
+├── test.bat / test.sh         # 🧪 Tests des endpoints
+├── test_api.py                # 🧪 Suite de tests
+├── gunicorn_config.py         # 🔧 Config production
+├── Dockerfile                  # 🐳 Container Docker
+├── docker-compose.yml          # 🐳 Orchestration Docker
+└── README.md                   # 📚 Documentation complète
+
+
+🌐 ENDPOINTS DISPONIBLES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Health Check
+  GET /health
+  → Vérifier que l'API répond
+
+Informations du modèle
+  GET /api/v1/info
+  → Récupérer les infos du modèle, features, zones disponibles
+
+Prédiction unique
+  POST /api/v1/predict/single
+  payload: {"zone_id": 1, "year": 2025, "month": 6}
+
+Prédictions batch
+  POST /api/v1/predict/batch
+  payload: {"zone_ids": [1,2,3], "start_date": "2025-06", "months": 6}
+
+Prédictions futures (36 mois)
+  GET /api/v1/predict/future?months=36
+  OR
+  GET /api/v1/predict/future?months=12
+
+Statistiques par zone
+  GET /api/v1/stats/by-zone
+  → Agrégés sur 36 mois
+
+Statistiques par mois
+  GET /api/v1/stats/by-month
+  → Saisonnalité des risques
+
+
+💾 FICHIER .env
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# PostgreSQL
+DB_HOST=localhost              # Serveur PostgreSQL
+DB_PORT=5432                   # Port PostgreSQL (défaut: 5432)
+DB_NAME=urbain_dw             # Nom de la base de données
+DB_USER=postgres              # Utilisateur PostgreSQL
+DB_PASSWORD=admin             # Mot de passe PostgreSQL
+DB_SCHEMA=public              # Schéma (défaut: public)
+
+# Flask
+FLASK_ENV=development         # development ou production
+FLASK_DEBUG=True              # Debug mode (uniquement dev)
+API_PORT=5000                 # Port de l'API
+
+# ML
+FAST_MODE=1                   # Mode rapide (moins de hyperparamètres)
+DB_LIMIT_ROWS=10000          # Limiter les lignes pour le développement
+
+
+🧪 EXEMPLES DE REQUÊTES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# Vérifier que l'API répond
+curl http://localhost:5000/health
+
+# Voir les infos du modèle
+curl http://localhost:5000/api/v1/info | jq
+
+# Prédiction unique pour la zone 1, juin 2025
+curl -X POST http://localhost:5000/api/v1/predict/single \
+  -H "Content-Type: application/json" \
+  -d '{
+    "zone_id": 1,
+    "year": 2025,
+    "month": 6
+  }' | jq
+
+# Prédictions batch (3 zones, 6 mois)
+curl -X POST http://localhost:5000/api/v1/predict/batch \
+  -H "Content-Type: application/json" \
+  -d '{
+    "zone_ids": [1, 2, 3],
+    "start_date": "2025-06",
+    "months": 6
+  }' | jq
+
+# Prédictions futures (12 mois)
+curl "http://localhost:5000/api/v1/predict/future?months=12" | jq
+
+# Statistiques par zone
+curl http://localhost:5000/api/v1/stats/by-zone | jq
+
+# Statistiques par mois
+curl http://localhost:5000/api/v1/stats/by-month | jq
+
+
+⚠️  TROUBLESHOOTING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+❌ "Impossible de connecter PostgreSQL"
+   ✓ Vérifier que PostgreSQL est installé et en cours d'exécution
+   ✓ Vérifier les paramètres dans .env
+   ✓ Tester: psql -h localhost -U postgres -d urbain_dw
+
+❌ "ModuleNotFoundError: No module named 'flask'"
+   ✓ Vérifier que les dépendances sont installées: pip install -r requirements.txt
+
+❌ "Connection refused at 127.0.0.1:5000"
+   ✓ Vérifier que l'API est bien démarrée (python app.py)
+   ✓ Vérifier le port dans .env (API_PORT=5000)
+
+❌ "Table introuvable"
+   ✓ Vérifier les noms des tables dans PostgreSQL
+   ✓ Vérifier que le schéma est correct dans .env
+
+
+🐳 DÉPLOIEMENT DOCKER
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. Démarrer avec Docker Compose
+   docker-compose up --build
+
+2. Arrêter
+   docker-compose down
+
+3. Voir les logs
+   docker-compose logs -f flask-api
+
+
+📚 DOCUMENTATION COMPLÈTE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Voir le fichier README.md pour:
+  • Documentation détaillée des endpoints
+  • Exemples de requêtes
+  • Codes d'erreur
+  • Architecture du projet
+
+
+🎯 PROCHAINES ÉTAPES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[ ] Éditer .env avec vos paramètres PostgreSQL
+[ ] Lancer l'API (run.bat ou run.sh)
+[ ] Tester les endpoints (test.bat ou test.sh)
+[ ] Intégrer avec vos applications frontend
+[ ] (Optionnel) Déployer avec Docker
+
+
+═══════════════════════════════════════════════════════════════════════════════
+
+Besoin d'aide? Consultez README.md ou les logs de l'application
