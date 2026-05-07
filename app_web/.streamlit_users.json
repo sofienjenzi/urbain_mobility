@@ -1,0 +1,37 @@
+{
+  "admin@insight.local": {
+    "name": "Admin Insight",
+    "email": "admin@insight.local",
+    "password": "admin123",
+    "role": "admin",
+    "created_at": "2026-05-06T19:18:05.525821"
+  },
+  "ministre@interior.gov": {
+    "name": "Ministre de l'Intérieur",
+    "email": "ministre@interior.gov",
+    "password": "ministre123",
+    "role": "ministre",
+    "created_at": "2026-05-06T19:18:05.525835"
+  },
+  "airparif@airparif.fr": {
+    "name": "Air ParIF",
+    "email": "airparif@airparif.fr",
+    "password": "airparif123",
+    "role": "air_parif",
+    "created_at": "2026-05-06T19:18:05.525838"
+  },
+  "citoyen@example.com": {
+    "name": "Jean Citoyen",
+    "email": "citoyen@example.com",
+    "password": "citoyen123",
+    "role": "citoyen",
+    "created_at": "2026-05-06T19:18:05.525839"
+  },
+  "transport@sncf.fr": {
+    "name": "Société de Transport (SNCF)",
+    "email": "transport@sncf.fr",
+    "password": "transport123",
+    "role": "transport",
+    "created_at": "2026-05-06T19:18:05.525841"
+  }
+}

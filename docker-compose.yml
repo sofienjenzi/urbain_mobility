@@ -23,7 +23,7 @@ services:
       - MLFLOW_TRACKING_URI=http://mlflow:5000
       - MLFLOW_EXPERIMENT=urban-mlops
       - FAST_MODE=${FAST_MODE:-1}
-      - DB_HOST=${DB_HOST:-localhost}
+      - DB_HOST=${DB_HOST:-host.docker.internal}
       - DB_PORT=${DB_PORT:-5432}
       - DB_NAME=${DB_NAME:-urbain_dw}
       - DB_USER=${DB_USER:-postgres}
@@ -35,15 +35,58 @@ services:
     depends_on:
       - mlflow
 
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/alert_rules.yml:/etc/prometheus/alert_rules.yml:ro
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--web.enable-lifecycle"
+    depends_on:
+      - api
+      - postgres_exporter
+
+  postgres_exporter:
+    image: prometheuscommunity/postgres-exporter:v0.15.0
+    ports:
+      - "9187:9187"
+    environment:
+      - DATA_SOURCE_NAME=postgresql://${DB_USER:-postgres}:${DB_PASSWORD:-admin}@${DB_HOST:-host.docker.internal}:${DB_PORT:-5432}/${DB_NAME:-urbain_dw}?sslmode=disable
+
+  grafana:
+    image: grafana/grafana:11.1.4
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+
   webapp:
     image: python:3.12-slim
     working_dir: /app
     volumes:
       - ./:/app
-    command: bash -lc "pip install -r requirements.txt && streamlit run webapp/app.py --server.port=8501 --server.address=0.0.0.0"
+      - "C:/Users/user/Downloads/Analyser Performance:/app/powerbi_exports:ro"
+    command: bash -lc "pip install --no-cache-dir -r requirements.txt && streamlit run webapp/app.py --server.port=8501 --server.address=0.0.0.0"
     ports:
       - "8501:8501"
     environment:
       - PREDICTION_API_URL=http://api:8000
+      - DB_HOST=${DB_HOST:-host.docker.internal}
+      - DB_PORT=${DB_PORT:-5432}
+      - DB_NAME=${DB_NAME:-urbain_dw}
+      - DB_USER=${DB_USER:-postgres}
+      - DB_PASSWORD=${DB_PASSWORD:-admin}
+      - DB_SCHEMA=${DB_SCHEMA:-public}
+      - POWERBI_EXPORT_DIR=/app/powerbi_exports
     depends_on:
       - api

@@ -9,7 +9,6 @@ mlflow
 fastapi
 uvicorn[standard]
 pydantic
-prometheus-client
 sqlalchemy
 psycopg2-binary
 pg8000
@@ -18,3 +17,4 @@ streamlit
 python-dotenv
 pytest
 httpx
+prometheus-client

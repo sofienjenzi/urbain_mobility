@@ -1,0 +1,56 @@
+groups:
+  - name: urban-mlops-alerts
+    rules:
+      - alert: HighApiLatency
+        expr: histogram_quantile(0.95, sum(rate(api_request_latency_seconds_bucket{endpoint!="/metrics"}[2m])) by (le, endpoint)) > 1
+        for: 30s
+        labels:
+          severity: warning
+        annotations:
+          summary: "High API latency"
+          description: "p95 latency is above 1 second for endpoint {{ $labels.endpoint }}."
+
+      - alert: HighApiErrorRate
+        expr: sum(rate(api_requests_total{status=~"5.."}[2m])) / clamp_min(sum(rate(api_requests_total[2m])), 1) > 0.05
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "High API error rate"
+          description: "More than 5% of API requests are returning 5xx errors."
+
+      - alert: AccuracyDegradation
+        expr: model_accuracy_drop_ratio > 0.05
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Model accuracy degradation"
+          description: "Objective {{ $labels.objective }} accuracy dropped by more than 5 points from baseline."
+
+      - alert: DataDriftDetected
+        expr: data_drift_score > 0.30
+        for: 30s
+        labels:
+          severity: warning
+        annotations:
+          summary: "Data drift detected"
+          description: "Objective {{ $labels.objective }} has drift score above 0.30."
+
+      - alert: ConfidenceDecrease
+        expr: model_baseline_confidence_score - model_confidence_score > 0.10
+        for: 30s
+        labels:
+          severity: warning
+        annotations:
+          summary: "Model confidence decrease"
+          description: "Objective {{ $labels.objective }} confidence is more than 10 points below baseline."
+
+      - alert: MissingValuesSpike
+        expr: data_missing_ratio > 0.20
+        for: 30s
+        labels:
+          severity: warning
+        annotations:
+          summary: "Missing values spike"
+          description: "Objective {{ $labels.objective }} received inputs with more than 20% missing values."
